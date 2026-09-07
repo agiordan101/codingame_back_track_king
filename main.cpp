@@ -1,4 +1,9 @@
-// v0.2 - Vibecoded
+// v1.0 -
+// - Find shortest distance amongs desired connections to build
+// - Skip connection if active
+// - Pick which region to disrupt: one with enemy rails, not yet inked,
+//     not containing one of our/their towns (can't disrupt those),
+//     preferring the one closest to being inked / with the most rails
 
 #include <iostream>
 #include <string>
@@ -95,7 +100,7 @@ struct Game
 
     // wishes: pairs of town ids that want to be connected
     vector<pair<int, int>> wishes;
-    // activeConnections: pairs of town ids that want to be connected
+    // activeConnections: pairs of town ids being connected
     map<pair<int, int>, bool> activeConnections;
 
     // quick lookup: town id -> coord
@@ -249,19 +254,25 @@ struct Game
 
             // Skip wish if link already made
             if (activeConnections.count({a, b}) || activeConnections.count({b, a}))
+            {
+                cerr << "Skipping already active connection: " << a << "-" << b << endl;
                 continue;
+            }
 
             Coord ac = townCoord[a];
             Coord bc = townCoord[b];
 
             auto dist = dijkstra(ac);
             int cost = dist[bc.y][bc.x];
+            cerr << "Considering wish: " << a << "-" << b << " with cost " << cost << endl;
+            
             if (cost == INT_MAX)
             {
                 cost = 1000 + abs(ac.x - bc.x) + abs(ac.y - bc.y);
             }
             if (!found || cost < bestCost)
             {
+                cerr << "New best wish: " << a << "-" << b << " with cost " << cost << endl;
                 found = true;
                 bestCost = cost;
                 bestA = a;
@@ -305,6 +316,7 @@ struct Game
                         sscanf(conn.c_str(), "%d-%d", &fromTownId, &toTownId);
                         connections.emplace_back(fromTownId, toTownId);
                         activeConnections[{fromTownId, toTownId}] = true;
+                        cerr << "Rails x=" << x << " y=" << y << ": Active connection: " << fromTownId << "-" << toTownId << endl;
                     }
                 }
                 Tile &tile = grid.get(x, y);
@@ -319,6 +331,8 @@ struct Game
     void gameTurn()
     {
         vector<string> actions;
+
+        computeBestWish();
 
         // --- Aggregate instability / inked / enemy rails per region ---
         unordered_map<int, int> inst;
