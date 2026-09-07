@@ -1,4 +1,4 @@
-// v1.0 -
+// v1.1
 // - Find shortest distance amongs desired connections to build
 // - Skip connection if active
 // - Pick which region to disrupt: one with enemy rails, not yet inked,
@@ -17,8 +17,48 @@
 #include <cstdio>
 #include <cmath>
 #include <climits>
+#include <chrono>
 
 using namespace std;
+
+// ====================
+// PROFILING
+
+// Per-function call counts and accumulated microseconds. Printed each turn
+// from main() alongside snapshotCommittedChild stats.
+
+struct ProfileScope
+{
+    int &elapsed;
+    std::chrono::steady_clock::time_point start;
+    ProfileScope(int &c, int &e) : elapsed(e), start(std::chrono::steady_clock::now()) { c++; }
+    ~ProfileScope()
+    {
+        elapsed += (int)std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    }
+};
+
+#define DECLARE_PROFILE(name) \
+    int callcount_##name = 0; \
+    int elapsed_##name = 0;
+
+#define PROFILE(name) ProfileScope _ps_##name(callcount_##name, elapsed_##name)
+
+#define PRINT_PROFILE(name)                                                                                                                                                                             \
+    do                                                                                                                                                                                                  \
+    {                                                                                                                                                                                                   \
+        if (callcount_##name != 0)                                                                                                                                                                      \
+            fprintf(stderr, "%-32s avg time : %f ms  \ttotals : %d ms  \t%d calls\n", #name, (double)elapsed_##name / callcount_##name / 1000, (int)((double)elapsed_##name / 1000), callcount_##name); \
+    } while (0)
+// fprintf(stderr, "%-32s avg time : %f ys  \ttotals : %d ys  \t%d calls\n", #name, (double)elapsed_##name / callcount_##name, elapsed_##name, callcount_##name); \
+
+// Profile declarations
+DECLARE_PROFILE(mainLoopturn)
+
+// ====================
+// STRUCTURES
 
 struct Coord
 {
@@ -255,7 +295,7 @@ struct Game
             // Skip wish if link already made
             if (activeConnections.count({a, b}) || activeConnections.count({b, a}))
             {
-                cerr << "Skipping already active connection: " << a << "-" << b << endl;
+                // cerr << "Skipping already active connection: " << a << "-" << b << endl;
                 continue;
             }
 
@@ -264,15 +304,15 @@ struct Game
 
             auto dist = dijkstra(ac);
             int cost = dist[bc.y][bc.x];
-            cerr << "Considering wish: " << a << "-" << b << " with cost " << cost << endl;
-            
+            // cerr << "Considering wish: " << a << "-" << b << " with cost " << cost << endl;
+
             if (cost == INT_MAX)
             {
                 cost = 1000 + abs(ac.x - bc.x) + abs(ac.y - bc.y);
             }
             if (!found || cost < bestCost)
             {
-                cerr << "New best wish: " << a << "-" << b << " with cost " << cost << endl;
+                // cerr << "New best wish: " << a << "-" << b << " with cost " << cost << endl;
                 found = true;
                 bestCost = cost;
                 bestA = a;
@@ -294,6 +334,8 @@ struct Game
 
     void parse()
     {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+
         cin >> myScore;
         cin >> foeScore;
         activeConnections.clear();
@@ -316,7 +358,7 @@ struct Game
                         sscanf(conn.c_str(), "%d-%d", &fromTownId, &toTownId);
                         connections.emplace_back(fromTownId, toTownId);
                         activeConnections[{fromTownId, toTownId}] = true;
-                        cerr << "Rails x=" << x << " y=" << y << ": Active connection: " << fromTownId << "-" << toTownId << endl;
+                        // cerr << "Rails x=" << x << " y=" << y << ": Active connection: " << fromTownId << "-" << toTownId << endl;
                     }
                 }
                 Tile &tile = grid.get(x, y);
@@ -443,14 +485,23 @@ struct Game
     }
 };
 
+int mainLoopturn(Game &game)
+{
+    PROFILE(mainLoopturn);
+
+    game.parse();
+    game.gameTurn();
+}
+
 int main()
 {
     Game game;
     game.init();
     while (true)
     {
-        game.parse();
-        game.gameTurn();
+        mainLoopturn(game);
+
+        PRINT_PROFILE(mainLoopturn);
     }
     cout << "prout" << endl;
 }
