@@ -1,9 +1,10 @@
-// v1.1
+// v1.2
 // - Find shortest distance amongs desired connections to build
 // - Skip connection if active
 // - Pick which region to disrupt: one with enemy rails, not yet inked,
 //     not containing one of our/their towns (can't disrupt those),
 //     preferring the one closest to being inked / with the most rails
+// - A* instead of floodfill & Skip dead town
 
 #include <iostream>
 #include <string>
@@ -229,25 +230,40 @@ struct Game
         return regionById[grid.get(x, y).regionId];
     }
 
-    // Dijkstra from src over the grid. Town cells cost 0 to cross (like Python).
-    vector<vector<int>> dijkstra(Coord src)
+    // A* between src and dst. Town cells cost 0 to cross (like Python).
+    // Returns the shortest path cost, or INT_MAX if dst is unreachable from src.
+    int aStar(Coord src, Coord dst)
     {
         int width = grid.width, height = grid.height;
-        vector<vector<int>> dist(height, vector<int>(width, INT_MAX));
-        dist[src.y][src.x] = 0;
 
-        // min-heap of (dist, x, y)
-        priority_queue<tuple<int, int, int>, vector<tuple<int, int, int>>, greater<>> pq;
-        pq.push({0, src.x, src.y});
+        // Best known cost from src to each cell found so far.
+        vector<vector<int>> gScore(height, vector<int>(width, INT_MAX));
+        gScore[src.y][src.x] = 0;
+
+        // Manhattan distance heuristic: admissible since the cheapest possible
+        // step cost is 1 (PLAINS), so it never overestimates the true cost.
+        auto heuristic = [&](int x, int y)
+        {
+            return abs(x - dst.x) + abs(y - dst.y);
+        };
+
+        // min-heap of (f = g + h, g, x, y)
+        priority_queue<tuple<int, int, int, int>, vector<tuple<int, int, int, int>>, greater<>> pq;
+        pq.push({heuristic(src.x, src.y), 0, src.x, src.y});
 
         const int dx[4] = {0, 1, 0, -1};
         const int dy[4] = {-1, 0, 1, 0};
 
         while (!pq.empty())
         {
-            auto [d, x, y] = pq.top();
+            auto [f, g, x, y] = pq.top();
             pq.pop();
-            if (d > dist[y][x])
+
+            if (x == dst.x && y == dst.y)
+                return g;
+
+            // Stale entry: a shorter path to (x, y) was already found.
+            if (g > gScore[y][x])
                 continue;
 
             for (int k = 0; k < 4; k++)
@@ -268,17 +284,18 @@ struct Game
                 if (step == INT_MAX)
                     continue;
 
-                int nd = d + step;
-                if (nd < dist[ny][nx])
+                int ng = g + step;
+                if (ng < gScore[ny][nx])
                 {
-                    dist[ny][nx] = nd;
-                    pq.push({nd, nx, ny});
+                    gScore[ny][nx] = ng;
+                    int nf = ng + heuristic(nx, ny);
+                    pq.push({nf, ng, nx, ny});
                 }
             }
         }
-        return dist;
-    }
 
+        return INT_MAX; // dst is unreachable
+    }
     // Equivalent of the Python "cheapest desired connection" computation.
     void computeBestWish()
     {
@@ -302,14 +319,12 @@ struct Game
             Coord ac = townCoord[a];
             Coord bc = townCoord[b];
 
-            auto dist = dijkstra(ac);
-            int cost = dist[bc.y][bc.x];
+            int cost = aStar(ac, bc);
             // cerr << "Considering wish: " << a << "-" << b << " with cost " << cost << endl;
 
             if (cost == INT_MAX)
-            {
-                cost = 1000 + abs(ac.x - bc.x) + abs(ac.y - bc.y);
-            }
+                continue;
+
             if (!found || cost < bestCost)
             {
                 // cerr << "New best wish: " << a << "-" << b << " with cost " << cost << endl;
