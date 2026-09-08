@@ -28,8 +28,9 @@ using namespace std;
 // Per-function call counts and accumulated microseconds. Printed each turn
 // from main() alongside snapshotCommittedChild stats.
 
-struct ProfileScope
+class ProfileScope
 {
+public:
     int &elapsed;
     std::chrono::steady_clock::time_point start;
     ProfileScope(int &c, int &e) : elapsed(e), start(std::chrono::steady_clock::now()) { c++; }
@@ -61,20 +62,23 @@ DECLARE_PROFILE(mainLoopturn)
 // ====================
 // STRUCTURES
 
-struct Coord
+class Coord
 {
+public:
     int x, y;
     Coord(int x = 0, int y = 0) : x(x), y(y) {}
 };
 
-struct Connection
+class Connection
 {
+public:
     int fromTownId, toTownId;
     Connection(int f = -1, int t = -1) : fromTownId(f), toTownId(t) {}
 };
 
-struct Tile
+class Tile
 {
+public:
     int regionId;
     int type;
     int tracksOwner;
@@ -85,8 +89,9 @@ struct Tile
         : regionId(r), type(t), tracksOwner(-1), inked(false), instability(0) {}
 };
 
-struct Town
+class Town
 {
+public:
     int id;
     Coord coord;
     vector<int> desiredConnections;
@@ -94,16 +99,18 @@ struct Town
         : id(id), coord(c), desiredConnections(move(d)) {}
 };
 
-struct Grid
+class Grid
 {
+public:
     int width, height;
     vector<Tile> tiles;
     Grid(int w = 0, int h = 0) : width(w), height(h) { tiles.resize(w * h); }
     Tile &get(int x, int y) { return tiles[y * width + x]; }
 };
 
-struct Region
+class Region
 {
+public:
     int id;
     int instability;
     bool inked;
@@ -129,20 +136,86 @@ static int terrainCost(int type)
     }
 }
 
-struct Game
+// ====================
+// PATHFINDING
+
+// Generic 4-directional A* on a width x height grid.
+//
+// stepCost(x, y) gives the cost of entering cell (x, y); return INT_MAX to
+// mark it impassable. Keeping the cost function a parameter is what makes
+// this a standalone helper: it knows nothing about tiles, towns or regions.
+//
+// Returns the shortest path cost from src to dst, or INT_MAX if dst is
+// unreachable. The Manhattan heuristic is admissible as long as no step
+// costs less than 1 (cheaper steps, e.g. free town cells, only make the
+// heuristic more conservative, never overestimating).
+template <typename StepCostFn>
+static int aStar(Coord src, Coord dst, int width, int height, StepCostFn stepCost)
 {
-    int myId;
-    int foeId;
+    // Best known cost from src to each cell found so far.
+    vector<vector<int>> gScore(height, vector<int>(width, INT_MAX));
+    gScore[src.y][src.x] = 0;
+
+    auto heuristic = [&](int x, int y)
+    {
+        return abs(x - dst.x) + abs(y - dst.y);
+    };
+
+    // min-heap of (f = g + h, g, x, y)
+    priority_queue<tuple<int, int, int, int>, vector<tuple<int, int, int, int>>, greater<>> pq;
+    pq.push({heuristic(src.x, src.y), 0, src.x, src.y});
+
+    const int dx[4] = {0, 1, 0, -1};
+    const int dy[4] = {-1, 0, 1, 0};
+
+    while (!pq.empty())
+    {
+        auto [f, g, x, y] = pq.top();
+        pq.pop();
+
+        if (x == dst.x && y == dst.y)
+            return g;
+
+        // Stale entry: a shorter path to (x, y) was already found.
+        if (g > gScore[y][x])
+            continue;
+
+        for (int k = 0; k < 4; k++)
+        {
+            int nx = x + dx[k], ny = y + dy[k];
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height)
+                continue;
+
+            int step = stepCost(nx, ny);
+            if (step == INT_MAX)
+                continue;
+
+            int ng = g + step;
+            if (ng < gScore[ny][nx])
+            {
+                gScore[ny][nx] = ng;
+                int nf = ng + heuristic(nx, ny);
+                pq.push({nf, ng, nx, ny});
+            }
+        }
+    }
+
+    return INT_MAX; // dst is unreachable
+}
+
+// ====================
+// MAP
+
+// Owns every piece of board state (Grid/Tile, Region, Town) and is the sole
+// interface to it. Nothing outside Map touches a Tile, Region, Grid or Town
+// container directly: callers go through the methods below, which may hand
+// back references to those sub-classes when a caller needs to read them.
+class Map
+{
+private:
     Grid grid;
     vector<Town> towns;
     unordered_map<int, Region> regionById;
-
-    int myScore, foeScore;
-
-    // wishes: pairs of town ids that want to be connected
-    vector<pair<int, int>> wishes;
-    // activeConnections: pairs of town ids being connected
-    map<pair<int, int>, bool> activeConnections;
 
     // quick lookup: town id -> coord
     unordered_map<int, Coord> townCoord;
@@ -154,47 +227,55 @@ struct Game
     // checked before ever adding a region to the disrupt candidates.
     unordered_map<int, bool> regionHasTown;
 
-    // Cheapest desired connection we've decided to build, if any.
-    bool hasTargetPair = false;
-    Coord targetA, targetB;
-
-    // Region we are currently trying to disrupt (persists across turns), -1 if none.
-    int targetRegion = -1;
-
-    void init()
+    Region &getRegionAt(int x, int y)
     {
-        cin >> myId;
-        foeId = 1 - myId;
-        int width, height;
-        cin >> width >> height;
-        grid = Grid(width, height);
-        activeConnections.clear();
+        return regionById[grid.get(x, y).regionId];
+    }
 
-        for (int y = 0; y < height; y++)
+public:
+    // ---- geometry ----
+
+    int width() const { return grid.width; }
+    int height() const { return grid.height; }
+
+    // ---- construction / parsing ----
+
+    // Reads the width/height + per-tile (regionId, type) block, building the
+    // grid and the region table.
+    void readTerrain(istream &in)
+    {
+        int w, h;
+        in >> w >> h;
+        grid = Grid(w, h);
+        regionById.clear();
+
+        for (int y = 0; y < h; y++)
         {
-            for (int x = 0; x < width; x++)
+            for (int x = 0; x < w; x++)
             {
                 int regionId, type;
-                cin >> regionId >> type;
-                Tile tile(regionId, type);
-                grid.get(x, y) = tile;
+                in >> regionId >> type;
+                grid.get(x, y) = Tile(regionId, type);
                 if (!regionById.count(regionId))
                 {
                     regionById.emplace(regionId, Region(regionId));
                 }
-                Region &region = regionById[regionId];
-                Coord coord(x, y);
-                region.coords.push_back(coord);
+                regionById[regionId].coords.push_back(Coord(x, y));
             }
         }
+    }
 
+    // Reads the town block. Every wish (townId, otherTownId) found is appended
+    // to outWishes so the caller keeps its own strategy-level list.
+    void readTowns(istream &in, vector<pair<int, int>> &outWishes)
+    {
         int townCount;
-        cin >> townCount;
+        in >> townCount;
         for (int i = 0; i < townCount; i++)
         {
             int townId, townX, townY;
             string desiredStr;
-            cin >> townId >> townX >> townY >> desiredStr;
+            in >> townId >> townX >> townY >> desiredStr;
             vector<int> desired;
             if (desiredStr != "x")
             {
@@ -211,7 +292,7 @@ struct Game
 
             for (int other : desired)
             {
-                wishes.emplace_back(townId, other);
+                outWishes.emplace_back(townId, other);
             }
         }
 
@@ -221,81 +302,134 @@ struct Game
         {
             regionHasTown[kv.first] = kv.second.hasTown;
         }
+    }
+
+    // Reads the per-turn tile state block. Each active connection found is
+    // recorded into outActiveConnections for the caller's own bookkeeping.
+    void readTurnState(istream &in, map<pair<int, int>, bool> &outActiveConnections)
+    {
+        for (int y = 0; y < grid.height; y++)
+        {
+            for (int x = 0; x < grid.width; x++)
+            {
+                int tracksOwner, instability;
+                string inkedStr, partStr;
+                in >> tracksOwner >> instability >> inkedStr >> partStr;
+                bool inked = (inkedStr != "0");
+                vector<Connection> connections;
+                if (partStr != "x")
+                {
+                    stringstream ss(partStr);
+                    string conn;
+                    while (getline(ss, conn, ','))
+                    {
+                        int fromTownId, toTownId;
+                        sscanf(conn.c_str(), "%d-%d", &fromTownId, &toTownId);
+                        connections.emplace_back(fromTownId, toTownId);
+                        outActiveConnections[{fromTownId, toTownId}] = true;
+                    }
+                }
+                Tile &tile = grid.get(x, y);
+                tile.tracksOwner = tracksOwner;
+                tile.inked = inked;
+                tile.instability = instability;
+                tile.partOfActiveConnections = connections;
+            }
+        }
+    }
+
+    // ---- town queries ----
+
+    bool hasTown(int townId) const { return townCoord.count(townId) != 0; }
+
+    // Precondition: hasTown(townId).
+    Coord townCoordOf(int townId) const { return townCoord.at(townId); }
+
+    const vector<Town> &allTowns() const { return towns; }
+
+    // ---- region queries ----
+
+    bool regionContainsTown(int regionId) const
+    {
+        auto it = regionHasTown.find(regionId);
+        return it != regionHasTown.end() && it->second;
+    }
+
+    // Per-region aggregates recomputed from the current tile state:
+    //   outInstability[r] - instability of region r
+    //   outInked         - regions with at least one inked tile
+    //   outFoeRails[r]   - number of tiles in r carrying foeId's rails
+    void aggregateRegions(int foeId,
+                          unordered_map<int, int> &outInstability,
+                          set<int> &outInked,
+                          unordered_map<int, int> &outFoeRails)
+    {
+        for (int y = 0; y < grid.height; y++)
+        {
+            for (int x = 0; x < grid.width; x++)
+            {
+                Tile &tile = grid.get(x, y);
+                int r = tile.regionId;
+                outInstability[r] = tile.instability;
+                if (tile.inked)
+                    outInked.insert(r);
+                if (tile.tracksOwner == foeId)
+                {
+                    outFoeRails[r] = outFoeRails[r] + 1;
+                }
+            }
+        }
+    }
+
+    // ---- pathfinding ----
+
+    // Shortest path cost between two towns' cells, using this map's terrain.
+    // Returns INT_MAX if dst is unreachable from src.
+    int aStar(Coord src, Coord dst)
+    {
+        return ::aStar(src, dst, grid.width, grid.height,
+                       [&](int x, int y)
+                       {
+                           // Town cells cost 0 to cross (like Python).
+                           if (townCells.count({x, y}))
+                               return 0;
+                           return terrainCost(grid.get(x, y).type);
+                       });
+    }
+};
+
+class Game
+{
+public:
+    int myId;
+    int foeId;
+    Map gameMap;
+
+    int myScore, foeScore;
+
+    // wishes: pairs of town ids that want to be connected
+    vector<pair<int, int>> wishes;
+    // activeConnections: pairs of town ids being connected
+    map<pair<int, int>, bool> activeConnections;
+
+    // Cheapest desired connection we've decided to build, if any.
+    bool hasTargetPair = false;
+    Coord targetA, targetB;
+
+    // Region we are currently trying to disrupt (persists across turns), -1 if none.
+    int targetRegion = -1;
+
+    void init()
+    {
+        cin >> myId;
+        foeId = 1 - myId;
+        gameMap.readTerrain(cin);
+        activeConnections.clear();
+        gameMap.readTowns(cin, wishes);
 
         computeBestWish();
     }
 
-    Region &getRegionAt(int x, int y)
-    {
-        return regionById[grid.get(x, y).regionId];
-    }
-
-    // A* between src and dst. Town cells cost 0 to cross (like Python).
-    // Returns the shortest path cost, or INT_MAX if dst is unreachable from src.
-    int aStar(Coord src, Coord dst)
-    {
-        int width = grid.width, height = grid.height;
-
-        // Best known cost from src to each cell found so far.
-        vector<vector<int>> gScore(height, vector<int>(width, INT_MAX));
-        gScore[src.y][src.x] = 0;
-
-        // Manhattan distance heuristic: admissible since the cheapest possible
-        // step cost is 1 (PLAINS), so it never overestimates the true cost.
-        auto heuristic = [&](int x, int y)
-        {
-            return abs(x - dst.x) + abs(y - dst.y);
-        };
-
-        // min-heap of (f = g + h, g, x, y)
-        priority_queue<tuple<int, int, int, int>, vector<tuple<int, int, int, int>>, greater<>> pq;
-        pq.push({heuristic(src.x, src.y), 0, src.x, src.y});
-
-        const int dx[4] = {0, 1, 0, -1};
-        const int dy[4] = {-1, 0, 1, 0};
-
-        while (!pq.empty())
-        {
-            auto [f, g, x, y] = pq.top();
-            pq.pop();
-
-            if (x == dst.x && y == dst.y)
-                return g;
-
-            // Stale entry: a shorter path to (x, y) was already found.
-            if (g > gScore[y][x])
-                continue;
-
-            for (int k = 0; k < 4; k++)
-            {
-                int nx = x + dx[k], ny = y + dy[k];
-                if (nx < 0 || nx >= width || ny < 0 || ny >= height)
-                    continue;
-
-                int step;
-                if (townCells.count({nx, ny}))
-                {
-                    step = 0;
-                }
-                else
-                {
-                    step = terrainCost(grid.get(nx, ny).type);
-                }
-                if (step == INT_MAX)
-                    continue;
-
-                int ng = g + step;
-                if (ng < gScore[ny][nx])
-                {
-                    gScore[ny][nx] = ng;
-                    int nf = ng + heuristic(nx, ny);
-                    pq.push({nf, ng, nx, ny});
-                }
-            }
-        }
-
-        return INT_MAX; // dst is unreachable
-    }
     // Equivalent of the Python "cheapest desired connection" computation.
     void computeBestWish()
     {
@@ -306,7 +440,7 @@ struct Game
         for (auto &wish : wishes)
         {
             int a = wish.first, b = wish.second;
-            if (!townCoord.count(a) || !townCoord.count(b))
+            if (!gameMap.hasTown(a) || !gameMap.hasTown(b))
                 continue;
 
             // Skip wish if link already made
@@ -316,10 +450,10 @@ struct Game
                 continue;
             }
 
-            Coord ac = townCoord[a];
-            Coord bc = townCoord[b];
+            Coord ac = gameMap.townCoordOf(a);
+            Coord bc = gameMap.townCoordOf(b);
 
-            int cost = aStar(ac, bc);
+            int cost = gameMap.aStar(ac, bc);
             // cerr << "Considering wish: " << a << "-" << b << " with cost " << cost << endl;
 
             if (cost == INT_MAX)
@@ -338,8 +472,8 @@ struct Game
         if (found)
         {
             hasTargetPair = true;
-            targetA = townCoord[bestA];
-            targetB = townCoord[bestB];
+            targetA = gameMap.townCoordOf(bestA);
+            targetB = gameMap.townCoordOf(bestB);
         }
         else
         {
@@ -349,40 +483,10 @@ struct Game
 
     void parse()
     {
-        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-
         cin >> myScore;
         cin >> foeScore;
         activeConnections.clear();
-        for (int y = 0; y < grid.height; y++)
-        {
-            for (int x = 0; x < grid.width; x++)
-            {
-                int tracksOwner, instability;
-                string inkedStr, partStr;
-                cin >> tracksOwner >> instability >> inkedStr >> partStr;
-                bool inked = (inkedStr != "0");
-                vector<Connection> connections;
-                if (partStr != "x")
-                {
-                    stringstream ss(partStr);
-                    string conn;
-                    while (getline(ss, conn, ','))
-                    {
-                        int fromTownId, toTownId;
-                        sscanf(conn.c_str(), "%d-%d", &fromTownId, &toTownId);
-                        connections.emplace_back(fromTownId, toTownId);
-                        activeConnections[{fromTownId, toTownId}] = true;
-                        // cerr << "Rails x=" << x << " y=" << y << ": Active connection: " << fromTownId << "-" << toTownId << endl;
-                    }
-                }
-                Tile &tile = grid.get(x, y);
-                tile.tracksOwner = tracksOwner;
-                tile.inked = inked;
-                tile.instability = instability;
-                tile.partOfActiveConnections = connections;
-            }
-        }
+        gameMap.readTurnState(cin, activeConnections);
     }
 
     void gameTurn()
@@ -396,21 +500,7 @@ struct Game
         set<int> inkedRegions;
         unordered_map<int, int> foeRails;
 
-        for (int y = 0; y < grid.height; y++)
-        {
-            for (int x = 0; x < grid.width; x++)
-            {
-                Tile &tile = grid.get(x, y);
-                int r = tile.regionId;
-                inst[r] = tile.instability;
-                if (tile.inked)
-                    inkedRegions.insert(r);
-                if (tile.tracksOwner == foeId)
-                {
-                    foeRails[r] = foeRails[r] + 1;
-                }
-            }
-        }
+        gameMap.aggregateRegions(foeId, inst, inkedRegions, foeRails);
 
         // --- Pick which region to disrupt: one with enemy rails, not yet inked,
         //     not containing one of our/their towns (can't disrupt those),
@@ -423,7 +513,7 @@ struct Game
             int r = kv.first;
             if (inkedRegions.count(r))
                 continue;
-            if (regionHasTown[r])
+            if (gameMap.regionContainsTown(r))
                 continue; // regions with a town can't be disrupted
             candidates.push_back(r);
         }
@@ -500,7 +590,7 @@ struct Game
     }
 };
 
-int mainLoopturn(Game &game)
+void mainLoopturn(Game &game)
 {
     PROFILE(mainLoopturn);
 
