@@ -240,6 +240,209 @@ static int aStar(Coord src, Coord dst, int width, int height, StepCostFn stepCos
 }
 
 // ====================
+// PATH LOOKUP TABLE
+
+// One cached path between two cells: its A* cost and the set of regions it
+// crosses. The region list is what makes targeted invalidation possible —
+// when a region is inked, only the paths that ran through it are wrong.
+class PathInfo
+{
+public:
+    int distance;
+    // Regions the path crosses, sorted and deduplicated.
+    vector<int> regions;
+    PathInfo() : distance(INT_MAX) {}
+};
+
+// Cache of cell-to-cell paths, plus the reverse index region -> paths that
+// cross it. Both are filled at the same time, so inking a region can drop
+// exactly the entries that depended on it instead of clearing everything.
+//
+// The cached distances describe the terrain (cost and ink), not the rails
+// laid during the search, so a single table stays valid for every beam node.
+class PathTable
+{
+public:
+    // Key for a cell pair. Paths are symmetric, so the two endpoints are
+    // stored in a canonical order and each pair is cached once.
+    typedef pair<int, int> CellPair; // (from index, to index)
+
+    // A whole distance field from one destination cell to every other cell,
+    // over terrain and ink only (rails excluded, so it survives every beam
+    // node). Cached because the rail walk queries it four times per step and
+    // it is otherwise recomputed for every choice at every node.
+    class DistanceField
+    {
+    public:
+        vector<int> dist; // indexed by cellIndex
+        vector<int> regions;
+        // Ink generation this field was built against; stale if older than
+        // the table's current generation.
+        int generation = 0;
+        DistanceField() {}
+    };
+
+private:
+    unordered_map<long long, PathInfo> paths;
+    // regionId -> keys of every cached path crossing that region.
+    unordered_map<int, vector<long long>> pathsByRegion;
+
+    // Distance fields keyed by destination cell, with the same reverse index
+    // so inking a region drops the fields that crossed it.
+    unordered_map<int, DistanceField> fields;
+    unordered_map<int, vector<int>> fieldsByRegion;
+
+    // Regions known to be inked, and the ink generation. The generation is
+    // bumped whenever a new region is inked, so any entry cached earlier is
+    // recognised as stale even if the reverse index no longer lists it.
+    set<int> inkedRegions;
+    int generation = 0;
+
+    int width, height;
+
+    long long makeKey(int fromIdx, int toIdx) const
+    {
+        // Canonical order: the table is symmetric.
+        if (fromIdx > toIdx)
+            swap(fromIdx, toIdx);
+        return (long long)fromIdx * (long long)(width * height) + toIdx;
+    }
+
+public:
+    // Statistics, printed with the other per-turn beam numbers.
+    int hits = 0, misses = 0, invalidations = 0;
+    int fieldHits = 0, fieldMisses = 0;
+
+    void init(int w, int h)
+    {
+        width = w;
+        height = h;
+        clear();
+    }
+
+    void clear()
+    {
+        paths.clear();
+        pathsByRegion.clear();
+        fields.clear();
+        fieldsByRegion.clear();
+    }
+
+    void resetStats()
+    {
+        hits = misses = invalidations = 0;
+        fieldHits = fieldMisses = 0;
+    }
+
+    // ---- distance fields ----
+
+    const DistanceField *findField(Coord dst)
+    {
+        auto it = fields.find(cellIndex(dst));
+        if (it == fields.end())
+        {
+            fieldMisses++;
+            return nullptr;
+        }
+        // Built before the latest region was inked: recompute it.
+        if (it->second.generation != generation)
+        {
+            fields.erase(it);
+            invalidations++;
+            fieldMisses++;
+            return nullptr;
+        }
+        fieldHits++;
+        return &it->second;
+    }
+
+    // Caches a field and indexes it under every region it reaches.
+    //
+    // Staleness is tracked with a generation counter rather than by refusing
+    // fields that touch inked regions: a field built now already accounts for
+    // the ink known now, and only entries created before the latest ink event
+    // are wrong. invalidateRegion() bumps the generation and drops those.
+    const DistanceField *insertField(Coord dst, DistanceField field)
+    {
+        int key = cellIndex(dst);
+        field.generation = generation;
+        for (int r : field.regions)
+            fieldsByRegion[r].push_back(key);
+        auto res = fields.insert_or_assign(key, move(field));
+        return &res.first->second;
+    }
+
+    int cellIndex(Coord c) const { return c.y * width + c.x; }
+
+    // Returns the cached entry for a pair, or nullptr on a miss.
+    const PathInfo *find(Coord a, Coord b)
+    {
+        auto it = paths.find(makeKey(cellIndex(a), cellIndex(b)));
+        if (it == paths.end())
+        {
+            misses++;
+            return nullptr;
+        }
+        hits++;
+        return &it->second;
+    }
+
+    // Stores a computed path and indexes it under every region it crosses.
+    void insert(Coord a, Coord b, PathInfo info)
+    {
+        long long key = makeKey(cellIndex(a), cellIndex(b));
+        for (int r : info.regions)
+            pathsByRegion[r].push_back(key);
+        paths[key] = move(info);
+    }
+
+    // Drops every path and field that crossed the region, so the next lookup
+    // recomputes it against the new (inked) terrain.
+    //
+    // The region is also remembered as inked: the reverse index is consumed
+    // here, so without that flag a field built later and registered under the
+    // same region would never be dropped again.
+    void invalidateRegion(int regionId)
+    {
+        // Only a region that was not already inked changes the terrain, and
+        // only then does everything cached earlier become stale.
+        if (!inkedRegions.insert(regionId).second)
+            return;
+        generation++;
+
+        auto it = pathsByRegion.find(regionId);
+        if (it != pathsByRegion.end())
+        {
+            for (long long key : it->second)
+            {
+                if (paths.erase(key))
+                    invalidations++;
+            }
+            pathsByRegion.erase(it);
+        }
+
+        auto fit = fieldsByRegion.find(regionId);
+        if (fit != fieldsByRegion.end())
+        {
+            for (int key : fit->second)
+            {
+                if (fields.erase(key))
+                    invalidations++;
+            }
+            fieldsByRegion.erase(fit);
+        }
+    }
+
+    bool isRegionInked(int regionId) const
+    {
+        return inkedRegions.count(regionId) != 0;
+    }
+
+    size_t size() const { return paths.size(); }
+    size_t fieldCount() const { return fields.size(); }
+};
+
+// ====================
 // MAP
 
 // Owns every piece of board state (Grid/Tile, Region, Town) and is the sole
@@ -264,6 +467,10 @@ private:
     // Lookup table: regionId -> does this region contain a town?
     unordered_map<int, bool> regionHasTown;
 
+    // Shared path cache. Not owned: every simulated Map points at the same
+    // table, so a Map copy stays cheap and the cache is filled once.
+    PathTable *pathTable = nullptr;
+
     Region &getRegionAt(int x, int y)
     {
         return regionById[grid.get(x, y).regionId];
@@ -274,6 +481,9 @@ public:
 
     int width() const { return grid.width; }
     int height() const { return grid.height; }
+
+    void setPathTable(PathTable *table) { pathTable = table; }
+    PathTable *paths() const { return pathTable; }
 
     bool inBounds(int x, int y) const
     {
@@ -389,6 +599,17 @@ public:
                     region.inked = true;
             }
         }
+
+        // Any region the referee reports as inked invalidates the paths that
+        // crossed it, exactly as a simulated DISRUPT would.
+        if (pathTable)
+        {
+            for (auto &kv : regionById)
+            {
+                if (kv.second.inked)
+                    pathTable->invalidateRegion(kv.first);
+            }
+        }
     }
 
     // ---- tile queries ----
@@ -502,6 +723,10 @@ public:
                 tile.inked = true;
                 tile.tracksOwner = NO_OWNER;
             }
+            // The region just became impassable: every cached path crossing
+            // it is stale and must be recomputed on next use.
+            if (pathTable)
+                pathTable->invalidateRegion(regionId);
         }
     }
 
@@ -617,6 +842,10 @@ public:
     int foeId;
     Map gameMap;
 
+    // Shared by every simulated Map, so paths are computed once per terrain
+    // state instead of once per beam node.
+    PathTable pathTable;
+
     int myScore, foeScore;
 
     // wishes: pairs of town ids that want to be connected
@@ -634,6 +863,8 @@ public:
         cin >> myId;
         foeId = 1 - myId;
         gameMap.readTerrain(cin);
+        pathTable.init(gameMap.width(), gameMap.height());
+        gameMap.setPathTable(&pathTable);
         activeConnections.clear();
         gameMap.readTowns(cin, wishes);
     }
@@ -785,44 +1016,77 @@ public:
         // Cells claimed so far this turn, so the walk does not reuse one.
         set<pair<int, int>> claimed;
 
-        // Distance from every cell to the destination, computed once with a
-        // single Dijkstra from the destination instead of one A* per
-        // candidate neighbour. Costs are symmetric (entering a cell costs the
-        // same either way), so a reverse search gives the same distances at a
-        // fraction of the work — this is the hot path of the whole search.
+        // Distance from every cell to the destination, from the shared lookup
+        // table. The field is built over terrain and ink only — rails laid
+        // during the search are deliberately excluded so one field stays
+        // valid for every beam node; the walk below still refuses occupied
+        // cells when it picks where to build.
         const int W = board.width(), H = board.height();
-        vector<vector<int>> distToDst(H, vector<int>(W, INT_MAX));
+        PathTable *table = board.paths();
+        PathTable::DistanceField localField;
+        const PathTable::DistanceField *field = nullptr;
 
+        if (table)
+            field = table->findField(choice.dst);
+
+        if (!field)
         {
+            PathTable::DistanceField built;
+            built.dist.assign(W * H, INT_MAX);
+            set<int> touched;
+
             priority_queue<tuple<int, int, int>, vector<tuple<int, int, int>>, greater<>> pq;
-            distToDst[choice.dst.y][choice.dst.x] = 0;
+            built.dist[choice.dst.y * W + choice.dst.x] = 0;
             pq.push({0, choice.dst.x, choice.dst.y});
 
             while (!pq.empty())
             {
                 auto [d, x, y] = pq.top();
                 pq.pop();
-                if (d > distToDst[y][x])
+                if (d > built.dist[y * W + x])
                     continue;
+                touched.insert(board.tileRegion(x, y));
 
                 for (int k = 0; k < 4; k++)
                 {
                     int nx = x + DIR_X[k], ny = y + DIR_Y[k];
                     if (!board.inBounds(nx, ny))
                         continue;
-                    // Only cells we could actually build on are traversable.
-                    if (!board.canPlaceRail(nx, ny))
+                    // Terrain-only traversability: a cell is usable unless it
+                    // is a town, inked, or impassable terrain.
+                    if (board.isTownCell(nx, ny) || board.isInked(nx, ny))
+                        continue;
+                    int cost = board.railCost(nx, ny);
+                    if (cost == INT_MAX)
                         continue;
 
-                    int nd = d + board.railCost(nx, ny);
-                    if (nd < distToDst[ny][nx])
+                    int nd = d + cost;
+                    if (nd < built.dist[ny * W + nx])
                     {
-                        distToDst[ny][nx] = nd;
+                        built.dist[ny * W + nx] = nd;
                         pq.push({nd, nx, ny});
                     }
                 }
             }
+
+            built.regions.assign(touched.begin(), touched.end());
+
+            // Keep the freshly built field locally in every case, then try to
+            // cache a copy. A field spanning an inked region is refused by the
+            // table, so the local copy is what this call uses.
+            localField = move(built);
+            field = &localField;
+
+            if (table)
+            {
+                const PathTable::DistanceField *cached =
+                    table->insertField(choice.dst, localField);
+                if (cached)
+                    field = cached;
+            }
         }
+
+        const vector<int> &distToDst = field->dist;
 
         Coord cur = choice.src;
         int paint = PAINT_PER_TURN;
@@ -842,7 +1106,7 @@ public:
                 if (board.railCost(nx, ny) > paint)
                     continue; // not enough paint left for this terrain
 
-                int d = distToDst[ny][nx];
+                int d = distToDst[ny * W + nx];
                 if (d == INT_MAX)
                     continue;
                 // Strictly-less keeps the earlier (higher priority) direction.
@@ -1149,6 +1413,7 @@ public:
         // Timed from after the input read, so blocking on stdin does not
         // count against the search budget.
         turnStart = std::chrono::steady_clock::now();
+        pathTable.resetStats();
 
         bool hasRail = false;
         RailChoice rail;
@@ -1206,7 +1471,9 @@ public:
 void mainLoopturn(Game &game)
 {
     if (!game.firstTurn)
+    {
         PROFILE(mainLoopturn);
+    }
 
     game.parse();
     game.gameTurn();
@@ -1221,6 +1488,11 @@ int main()
         mainLoopturn(game);
 
         game.beamStats.print();
+        fprintf(stderr, "%-32s path LT : %d hits / %d misses, fields %d/%d, "
+                        "%d invalidated, %d cached\n",
+                "pathTable", game.pathTable.hits, game.pathTable.misses,
+                game.pathTable.fieldHits, game.pathTable.fieldMisses,
+                game.pathTable.invalidations, (int)game.pathTable.fieldCount());
 
         // PRINT_PROFILE(mainLoopturn);
         PRINT_PROFILE(beamSearch);

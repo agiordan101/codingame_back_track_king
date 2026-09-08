@@ -87,6 +87,15 @@ On peut faire une LT qui garde une struct d'info "path" entre 2 cells :
 Une structure associé pourrait permettre de retrouver tous les path qui passe par une région. Créé en même temps
 De cette manière, lorsque la région est inked, on peut recalculer tous les paths qui l'utilisait
 
+
+### Cache A* results instead of lookup tables
+
+Each time we want a A* distance, verify if a cache entry exist :
+- If so, verify the inkedRegion count is the same as the cached value :
+    - If so, return it
+    - Else, compute A* distance, save in cache with inkedRegion count
+- If not, compute A* distance, save in cache with inkedRegion count
+
 ## Next steps
 
 - Créer les actions avec tous les groupes de rails >= 3 plutot que ceux directement lié aux towns ?
