@@ -91,7 +91,12 @@ De cette manière, lorsque la région est inked, on peut recalculer tous les pat
 
 - Créer les actions avec tous les groupes de rails >= 3 plutot que ceux directement lié aux towns ?
 - Créer une heuristic
-- Ne pas créer des moves uniquement sur les groupe de rails des villes pas encore lié
+- Ne pas créer des moves uniquement sur les groupe de rails des villes pas encore lié :
+    - Creer des moves sur les fin de chemin vers le rail le plus proche qui n'est pas du même groupe 
+
+- Il faut qu'un choix de placement soit un ensemble de 3 rails et pas juste une src/dst
+    - Des fois on veut 1 ou 2 rails sur la tache principale, et commencer immédiatement une autre tache
+    -> Une depth de beam devrait être 1 rail
 
 ## Explanations
 

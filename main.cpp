@@ -930,6 +930,61 @@ public:
 
     // ---- beam search ----
 
+    // Per-turn beam search statistics, printed to stderr at the end of the
+    // turn. Reset by beamSearch() on every call.
+    class BeamStats
+    {
+    public:
+        // Deepest depth level actually expanded (0 = none completed).
+        int maxDepth;
+        // Every child state created this turn, across all depths.
+        int totalStates;
+        // Actions (rail choices) generated per depth, and how many depths
+        // contributed, so the average can be reported per depth.
+        vector<int> actionsPerDepth;
+        vector<int> statesPerDepth;
+        // Nodes whose expansion was cut short by the time budget.
+        int truncatedByTime;
+
+        BeamStats() { reset(); }
+
+        void reset()
+        {
+            maxDepth = 0;
+            totalStates = 0;
+            truncatedByTime = 0;
+            actionsPerDepth.assign(MAX_DEPTH, 0);
+            statesPerDepth.assign(MAX_DEPTH, 0);
+        }
+
+        // Mean number of actions generated per expanded depth.
+        double avgActionsPerDepth() const
+        {
+            if (maxDepth == 0)
+                return 0.0;
+            int sum = 0;
+            for (int d = 0; d < maxDepth; d++)
+                sum += actionsPerDepth[d];
+            return (double)sum / maxDepth;
+        }
+
+        void print() const
+        {
+            fprintf(stderr, "%-32s max depth : %d / %d\n", "beamStats", maxDepth, MAX_DEPTH);
+            fprintf(stderr, "%-32s total states : %d\n", "beamStats", totalStates);
+            fprintf(stderr, "%-32s avg actions/depth : %.2f\n", "beamStats",
+                    avgActionsPerDepth());
+            if (truncatedByTime)
+                fprintf(stderr, "%-32s time-truncated expansions : %d\n", "beamStats",
+                        truncatedByTime);
+            for (int d = 0; d < maxDepth; d++)
+                fprintf(stderr, "%-32s   depth %-2d : %d actions, %d states\n", "beamStats",
+                        d, actionsPerDepth[d], statesPerDepth[d]);
+        }
+    };
+
+    BeamStats beamStats;
+
     class BeamNode
     {
     public:
@@ -952,6 +1007,7 @@ public:
 
         outHasRail = false;
         outDisrupt = -1;
+        beamStats.reset();
 
         BeamNode root;
         root.state = gameMap;
@@ -977,12 +1033,16 @@ public:
             for (BeamNode &node : beam)
             {
                 if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    beamStats.truncatedByTime++;
                     break;
+                }
 
                 // 2. Copy current_state in turn_state (node.state is turn_state).
                 // 3. Generate rail choices.
                 vector<RailChoice> railChoices =
                     buildRailChoices(node.state, wishes, node.active);
+                beamStats.actionsPerDepth[depth] += (int)railChoices.size();
 
                 // 4. Generate both players' best disrupt choices.
                 int myDisrupt = buildDisruptChoice(node.state, wishes, myId, foeId);
@@ -1023,7 +1083,10 @@ public:
                     // Expanding a choice is the expensive step, so the budget
                     // is checked here too rather than once per node.
                     if (std::chrono::steady_clock::now() >= deadline)
+                    {
+                        beamStats.truncatedByTime++;
                         break;
+                    }
 
                     BeamNode child;
                     child.state = node.state; // copy turn_state
@@ -1051,8 +1114,16 @@ public:
                 }
             }
 
+            // Every child built at this depth counts as a state encountered,
+            // even the ones the Bwidth cut discards below.
+            beamStats.statesPerDepth[depth] = (int)nextBeam.size();
+            beamStats.totalStates += (int)nextBeam.size();
+
             if (nextBeam.empty())
                 break;
+
+            // This depth produced states, so it counts as expanded.
+            beamStats.maxDepth = depth + 1;
 
             // 8. Keep the Bwidth best states.
             sort(nextBeam.begin(), nextBeam.end(),
@@ -1149,10 +1220,12 @@ int main()
     {
         mainLoopturn(game);
 
-        PRINT_PROFILE(mainLoopturn);
+        game.beamStats.print();
+
+        // PRINT_PROFILE(mainLoopturn);
         PRINT_PROFILE(beamSearch);
-        PRINT_PROFILE(railChoices);
-        PRINT_PROFILE(disruptChoice);
-        PRINT_PROFILE(simulateTurn);
+        // PRINT_PROFILE(railChoices);
+        // PRINT_PROFILE(disruptChoice);
+        // PRINT_PROFILE(simulateTurn);
     }
 }
