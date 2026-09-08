@@ -375,7 +375,9 @@ public:
                     }
                 }
                 Tile &tile = grid.get(x, y);
-                tile.tracksOwner = tracksOwner;
+                // An inked region has been erased: whatever the referee
+                // reports, it holds no usable rail any more.
+                tile.tracksOwner = inked ? NO_OWNER : tracksOwner;
                 tile.inked = inked;
                 tile.instability = instability;
                 tile.partOfActiveConnections = connections;
@@ -399,7 +401,9 @@ public:
     bool isTownCell(int x, int y) const { return townCells.count({x, y}) != 0; }
     bool hasRail(int x, int y) const { return grid.get(x, y).tracksOwner != NO_OWNER; }
 
-    // A rail can be placed only on an empty, non-town, passable tile.
+    // A rail can be placed only on an empty, non-town, passable tile whose
+    // region has not been erased with ink. An inked region is gone for good,
+    // so building there is always a wasted (and rejected) action.
     bool canPlaceRail(int x, int y) const
     {
         if (!inBounds(x, y))
@@ -408,7 +412,21 @@ public:
             return false;
         if (hasRail(x, y))
             return false;
+        if (isInked(x, y))
+            return false;
         return terrainCost(grid.get(x, y).type) != INT_MAX;
+    }
+
+    // True when the tile, or the region it belongs to, has been inked. Both
+    // are checked because a region can be inked mid-search (by a simulated
+    // DISRUPT) between two beam depths.
+    bool isInked(int x, int y) const
+    {
+        const Tile &tile = grid.get(x, y);
+        if (tile.inked)
+            return true;
+        auto it = regionById.find(tile.regionId);
+        return it != regionById.end() && it->second.inked;
     }
 
     int railCost(int x, int y) const { return terrainCost(grid.get(x, y).type); }
@@ -425,9 +443,12 @@ public:
     }
 
     // A cell is traversable by a connection path if it holds a rail or a town.
+    // Rails in an inked region no longer exist, so they never connect.
     bool isConnectable(int x, int y) const
     {
-        return isTownCell(x, y) || hasRail(x, y);
+        if (isTownCell(x, y))
+            return true;
+        return hasRail(x, y) && !isInked(x, y);
     }
 
     // ---- town queries ----
@@ -1113,7 +1134,8 @@ public:
 
 void mainLoopturn(Game &game)
 {
-    PROFILE(mainLoopturn);
+    if (!game.firstTurn)
+        PROFILE(mainLoopturn);
 
     game.parse();
     game.gameTurn();

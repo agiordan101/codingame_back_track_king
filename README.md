@@ -90,6 +90,8 @@ De cette manière, lorsque la région est inked, on peut recalculer tous les pat
 ## Next steps
 
 - Créer les actions avec tous les groupes de rails >= 3 plutot que ceux directement lié aux towns ?
+- Créer une heuristic
+- Ne pas créer des moves uniquement sur les groupe de rails des villes pas encore lié
 
 ## Explanations
 
