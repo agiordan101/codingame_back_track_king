@@ -1,10 +1,11 @@
-// v1.2
-// - Find shortest distance amongs desired connections to build
-// - Skip connection if active
-// - Pick which region to disrupt: one with enemy rails, not yet inked,
-//     not containing one of our/their towns (can't disrupt those),
-//     preferring the one closest to being inked / with the most rails
-// - A* instead of floodfill & Skip dead town
+// v2.0
+// - Beam search over simulated future states
+// - Rail placement choices: shortest link between the two rail groups
+//     already connected to each town of an unbuilt desired connection
+// - Disrupt choice: best region where the opponent owns more connection
+//     rails than we do
+// - Greedy 3-paint-point rail application, A*-guided, NORTH/EAST/SOUTH/WEST
+//     tie-breaking
 
 #include <iostream>
 #include <string>
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <sstream>
 #include <queue>
@@ -54,10 +56,43 @@ public:
         if (callcount_##name != 0)                                                                                                                                                                      \
             fprintf(stderr, "%-32s avg time : %f ms  \ttotals : %d ms  \t%d calls\n", #name, (double)elapsed_##name / callcount_##name / 1000, (int)((double)elapsed_##name / 1000), callcount_##name); \
     } while (0)
-// fprintf(stderr, "%-32s avg time : %f ys  \ttotals : %d ys  \t%d calls\n", #name, (double)elapsed_##name / callcount_##name, elapsed_##name, callcount_##name); \
 
 // Profile declarations
 DECLARE_PROFILE(mainLoopturn)
+DECLARE_PROFILE(beamSearch)
+DECLARE_PROFILE(railChoices)
+DECLARE_PROFILE(disruptChoice)
+DECLARE_PROFILE(simulateTurn)
+
+// ====================
+// CONSTANTS
+
+static const int BEAM_WIDTH = 20;
+static const int MAX_DEPTH = 10;
+static const int PAINT_PER_TURN = 3;
+
+// Wall-clock budget for one turn's search. The referee allows 50 ms per turn
+// (1000 ms on the first). The deadline is only tested between expansions, so
+// the budget stays well under the limit to absorb one in-flight expansion
+// plus the final replay and output.
+static const int TURN_BUDGET_MS = 20;
+static const int FIRST_TURN_BUDGET_MS = 700;
+
+// Owner marker for a tile carrying no rail.
+static const int NO_OWNER = -1;
+// Owner marker for a rail both players placed on the same turn.
+static const int NEUTRAL_OWNER = 2;
+
+// Instability a region gains per DISRUPT, and the level at which it gets
+// inked (erasing every rail inside it): the statement defines inked as
+// instability >= 4.
+static const int DISRUPT_INSTABILITY_GAIN = 1;
+static const int INK_INSTABILITY_THRESHOLD = 4;
+
+// Direction priority: NORTH, EAST, SOUTH, WEST. Used both for path
+// tie-breaking and for choosing which neighbour a rail advances to.
+static const int DIR_X[4] = {0, 1, 0, -1};
+static const int DIR_Y[4] = {-1, 0, 1, 0};
 
 // ====================
 // STRUCTURES
@@ -67,6 +102,8 @@ class Coord
 public:
     int x, y;
     Coord(int x = 0, int y = 0) : x(x), y(y) {}
+    bool operator==(const Coord &o) const { return x == o.x && y == o.y; }
+    bool operator!=(const Coord &o) const { return !(*this == o); }
 };
 
 class Connection
@@ -86,7 +123,7 @@ public:
     int instability;
     vector<Connection> partOfActiveConnections;
     Tile(int r = 0, int t = 0)
-        : regionId(r), type(t), tracksOwner(-1), inked(false), instability(0) {}
+        : regionId(r), type(t), tracksOwner(NO_OWNER), inked(false), instability(0) {}
 };
 
 class Town
@@ -106,6 +143,7 @@ public:
     vector<Tile> tiles;
     Grid(int w = 0, int h = 0) : width(w), height(h) { tiles.resize(w * h); }
     Tile &get(int x, int y) { return tiles[y * width + x]; }
+    const Tile &get(int x, int y) const { return tiles[y * width + x]; }
 };
 
 class Region
@@ -119,8 +157,7 @@ public:
     Region(int id = 0) : id(id), instability(0), inked(false), hasTown(false) {}
 };
 
-// Cost to cross a terrain type (mirrors Python's COST dict).
-// Types not listed (e.g. 3 = POI) are impassable, just like the Python version.
+// Paint cost to place a rail on a terrain type.
 static int terrainCost(int type)
 {
     switch (type)
@@ -132,7 +169,7 @@ static int terrainCost(int type)
     case 2:
         return 3; // MOUNTAIN
     default:
-        return INT_MAX; // impassable (POI or unknown)
+        return INT_MAX; // impassable (unknown)
     }
 }
 
@@ -152,7 +189,9 @@ static int terrainCost(int type)
 template <typename StepCostFn>
 static int aStar(Coord src, Coord dst, int width, int height, StepCostFn stepCost)
 {
-    // Best known cost from src to each cell found so far.
+    if (src == dst)
+        return 0;
+
     vector<vector<int>> gScore(height, vector<int>(width, INT_MAX));
     gScore[src.y][src.x] = 0;
 
@@ -164,9 +203,6 @@ static int aStar(Coord src, Coord dst, int width, int height, StepCostFn stepCos
     // min-heap of (f = g + h, g, x, y)
     priority_queue<tuple<int, int, int, int>, vector<tuple<int, int, int, int>>, greater<>> pq;
     pq.push({heuristic(src.x, src.y), 0, src.x, src.y});
-
-    const int dx[4] = {0, 1, 0, -1};
-    const int dy[4] = {-1, 0, 1, 0};
 
     while (!pq.empty())
     {
@@ -182,7 +218,7 @@ static int aStar(Coord src, Coord dst, int width, int height, StepCostFn stepCos
 
         for (int k = 0; k < 4; k++)
         {
-            int nx = x + dx[k], ny = y + dy[k];
+            int nx = x + DIR_X[k], ny = y + DIR_Y[k];
             if (nx < 0 || nx >= width || ny < 0 || ny >= height)
                 continue;
 
@@ -210,6 +246,9 @@ static int aStar(Coord src, Coord dst, int width, int height, StepCostFn stepCos
 // interface to it. Nothing outside Map touches a Tile, Region, Grid or Town
 // container directly: callers go through the methods below, which may hand
 // back references to those sub-classes when a caller needs to read them.
+//
+// A Map is copied wholesale by the beam search to represent a simulated
+// future state, so it stays a plain value type.
 class Map
 {
 private:
@@ -219,12 +258,10 @@ private:
 
     // quick lookup: town id -> coord
     unordered_map<int, Coord> townCoord;
-    // set of cells that contain a town (cost 0 to cross, like in Python)
+    // set of cells that contain a town
     set<pair<int, int>> townCells;
 
     // Lookup table: regionId -> does this region contain a town?
-    // A region containing a town can never be disrupted, so this is
-    // checked before ever adding a region to the disrupt candidates.
     unordered_map<int, bool> regionHasTown;
 
     Region &getRegionAt(int x, int y)
@@ -238,10 +275,14 @@ public:
     int width() const { return grid.width; }
     int height() const { return grid.height; }
 
+    bool inBounds(int x, int y) const
+    {
+        return x >= 0 && x < grid.width && y >= 0 && y < grid.height;
+    }
+
     // ---- construction / parsing ----
 
-    // Reads the width/height + per-tile (regionId, type) block, building the
-    // grid and the region table.
+    // Reads the width/height + per-tile (regionId, type) block.
     void readTerrain(istream &in)
     {
         int w, h;
@@ -296,8 +337,6 @@ public:
             }
         }
 
-        // Build the regionId -> hasTown lookup table now that every town's
-        // region has been flagged (getRegionAt(...).hasTown = true above).
         for (auto &kv : regionById)
         {
             regionHasTown[kv.first] = kv.second.hasTown;
@@ -308,6 +347,12 @@ public:
     // recorded into outActiveConnections for the caller's own bookkeeping.
     void readTurnState(istream &in, map<pair<int, int>, bool> &outActiveConnections)
     {
+        for (auto &kv : regionById)
+        {
+            kv.second.instability = 0;
+            kv.second.inked = false;
+        }
+
         for (int y = 0; y < grid.height; y++)
         {
             for (int x = 0; x < grid.width; x++)
@@ -334,17 +379,61 @@ public:
                 tile.inked = inked;
                 tile.instability = instability;
                 tile.partOfActiveConnections = connections;
+
+                // Mirror per-tile instability/ink onto the owning region.
+                Region &region = regionById[tile.regionId];
+                region.instability = max(region.instability, instability);
+                if (inked)
+                    region.inked = true;
             }
         }
+    }
+
+    // ---- tile queries ----
+
+    int tileType(int x, int y) const { return grid.get(x, y).type; }
+    int tileOwner(int x, int y) const { return grid.get(x, y).tracksOwner; }
+    int tileRegion(int x, int y) const { return grid.get(x, y).regionId; }
+    bool tileInked(int x, int y) const { return grid.get(x, y).inked; }
+
+    bool isTownCell(int x, int y) const { return townCells.count({x, y}) != 0; }
+    bool hasRail(int x, int y) const { return grid.get(x, y).tracksOwner != NO_OWNER; }
+
+    // A rail can be placed only on an empty, non-town, passable tile.
+    bool canPlaceRail(int x, int y) const
+    {
+        if (!inBounds(x, y))
+            return false;
+        if (isTownCell(x, y))
+            return false;
+        if (hasRail(x, y))
+            return false;
+        return terrainCost(grid.get(x, y).type) != INT_MAX;
+    }
+
+    int railCost(int x, int y) const { return terrainCost(grid.get(x, y).type); }
+
+    // Places a rail, applying the neutral-owner rule when both players
+    // target the same tile on the same turn.
+    void placeRail(int x, int y, int owner)
+    {
+        Tile &tile = grid.get(x, y);
+        if (tile.tracksOwner == NO_OWNER)
+            tile.tracksOwner = owner;
+        else if (tile.tracksOwner != owner)
+            tile.tracksOwner = NEUTRAL_OWNER;
+    }
+
+    // A cell is traversable by a connection path if it holds a rail or a town.
+    bool isConnectable(int x, int y) const
+    {
+        return isTownCell(x, y) || hasRail(x, y);
     }
 
     // ---- town queries ----
 
     bool hasTown(int townId) const { return townCoord.count(townId) != 0; }
-
-    // Precondition: hasTown(townId).
     Coord townCoordOf(int townId) const { return townCoord.at(townId); }
-
     const vector<Town> &allTowns() const { return towns; }
 
     // ---- region queries ----
@@ -355,48 +444,150 @@ public:
         return it != regionHasTown.end() && it->second;
     }
 
-    // Per-region aggregates recomputed from the current tile state:
-    //   outInstability[r] - instability of region r
-    //   outInked         - regions with at least one inked tile
-    //   outFoeRails[r]   - number of tiles in r carrying foeId's rails
-    void aggregateRegions(int foeId,
-                          unordered_map<int, int> &outInstability,
-                          set<int> &outInked,
-                          unordered_map<int, int> &outFoeRails)
+    bool regionInked(int regionId) const
     {
-        for (int y = 0; y < grid.height; y++)
+        auto it = regionById.find(regionId);
+        return it != regionById.end() && it->second.inked;
+    }
+
+    vector<int> allRegionIds() const
+    {
+        vector<int> ids;
+        ids.reserve(regionById.size());
+        for (auto &kv : regionById)
+            ids.push_back(kv.first);
+        sort(ids.begin(), ids.end());
+        return ids;
+    }
+
+    // Raises a region's instability, inking it (and erasing every rail it
+    // contains) once it crosses the threshold.
+    void disruptRegion(int regionId)
+    {
+        auto it = regionById.find(regionId);
+        if (it == regionById.end())
+            return;
+        Region &region = it->second;
+        if (region.inked)
+            return;
+
+        region.instability += DISRUPT_INSTABILITY_GAIN;
+        if (region.instability >= INK_INSTABILITY_THRESHOLD)
         {
-            for (int x = 0; x < grid.width; x++)
+            region.inked = true;
+            for (const Coord &c : region.coords)
             {
-                Tile &tile = grid.get(x, y);
-                int r = tile.regionId;
-                outInstability[r] = tile.instability;
-                if (tile.inked)
-                    outInked.insert(r);
-                if (tile.tracksOwner == foeId)
-                {
-                    outFoeRails[r] = outFoeRails[r] + 1;
-                }
+                Tile &tile = grid.get(c.x, c.y);
+                tile.inked = true;
+                tile.tracksOwner = NO_OWNER;
             }
         }
     }
 
-    // ---- pathfinding ----
+    // ---- rail groups ----
 
-    // Shortest path cost between two towns' cells, using this map's terrain.
-    // Returns INT_MAX if dst is unreachable from src.
-    int aStar(Coord src, Coord dst)
+    // Every cell reachable from a town through an unbroken run of rails and
+    // towns. This is the "rail group connected to the town" of the spec.
+    vector<Coord> railGroupOf(Coord townCell) const
     {
-        return ::aStar(src, dst, grid.width, grid.height,
-                       [&](int x, int y)
-                       {
-                           // Town cells cost 0 to cross (like Python).
-                           if (townCells.count({x, y}))
-                               return 0;
-                           return terrainCost(grid.get(x, y).type);
-                       });
+        vector<Coord> group;
+        if (!inBounds(townCell.x, townCell.y))
+            return group;
+
+        vector<vector<bool>> seen(grid.height, vector<bool>(grid.width, false));
+        vector<Coord> stack{townCell};
+        seen[townCell.y][townCell.x] = true;
+
+        while (!stack.empty())
+        {
+            Coord cur = stack.back();
+            stack.pop_back();
+            group.push_back(cur);
+
+            for (int k = 0; k < 4; k++)
+            {
+                int nx = cur.x + DIR_X[k], ny = cur.y + DIR_Y[k];
+                if (!inBounds(nx, ny) || seen[ny][nx])
+                    continue;
+                if (!isConnectable(nx, ny))
+                    continue;
+                seen[ny][nx] = true;
+                stack.push_back(Coord(nx, ny));
+            }
+        }
+        return group;
+    }
+
+    // ---- connections ----
+
+    // Shortest rail/town path between two towns, honouring the
+    // NORTH/EAST/SOUTH/WEST tie-break. Empty if the towns are not linked.
+    vector<Coord> connectionPath(Coord from, Coord to) const
+    {
+        if (!inBounds(from.x, from.y) || !inBounds(to.x, to.y))
+            return {};
+
+        vector<vector<int>> dist(grid.height, vector<int>(grid.width, INT_MAX));
+        vector<vector<Coord>> parent(grid.height, vector<Coord>(grid.width, Coord(-1, -1)));
+
+        queue<Coord> q;
+        dist[from.y][from.x] = 0;
+        q.push(from);
+
+        while (!q.empty())
+        {
+            Coord cur = q.front();
+            q.pop();
+            if (cur == to)
+                break;
+
+            // Neighbours are visited in NORTH/EAST/SOUTH/WEST order, so the
+            // first parent recorded for a cell already follows the priority.
+            for (int k = 0; k < 4; k++)
+            {
+                int nx = cur.x + DIR_X[k], ny = cur.y + DIR_Y[k];
+                if (!inBounds(nx, ny))
+                    continue;
+                if (dist[ny][nx] != INT_MAX)
+                    continue;
+                if (!isConnectable(nx, ny))
+                    continue;
+                dist[ny][nx] = dist[cur.y][cur.x] + 1;
+                parent[ny][nx] = cur;
+                q.push(Coord(nx, ny));
+            }
+        }
+
+        if (dist[to.y][to.x] == INT_MAX)
+            return {};
+
+        vector<Coord> path;
+        for (Coord cur = to; cur != Coord(-1, -1); cur = parent[cur.y][cur.x])
+        {
+            path.push_back(cur);
+            if (cur == from)
+                break;
+        }
+        reverse(path.begin(), path.end());
+        return path;
     }
 };
+
+// ====================
+// CHOICES
+
+// A rail placement choice: build from src towards dst.
+class RailChoice
+{
+public:
+    Coord src, dst;
+    int distance;
+    RailChoice(Coord s = {}, Coord d = {}, int dist = INT_MAX)
+        : src(s), dst(d), distance(dist) {}
+};
+
+// ====================
+// GAME
 
 class Game
 {
@@ -412,12 +603,10 @@ public:
     // activeConnections: pairs of town ids being connected
     map<pair<int, int>, bool> activeConnections;
 
-    // Cheapest desired connection we've decided to build, if any.
-    bool hasTargetPair = false;
-    Coord targetA, targetB;
-
-    // Region we are currently trying to disrupt (persists across turns), -1 if none.
-    int targetRegion = -1;
+    // Start of the current turn, used to bound the search.
+    std::chrono::steady_clock::time_point turnStart;
+    // The first turn has a far larger time allowance than the others.
+    bool firstTurn = true;
 
     void init()
     {
@@ -426,59 +615,6 @@ public:
         gameMap.readTerrain(cin);
         activeConnections.clear();
         gameMap.readTowns(cin, wishes);
-
-        computeBestWish();
-    }
-
-    // Equivalent of the Python "cheapest desired connection" computation.
-    void computeBestWish()
-    {
-        bool found = false;
-        int bestCost = INT_MAX;
-        int bestA = -1, bestB = -1;
-
-        for (auto &wish : wishes)
-        {
-            int a = wish.first, b = wish.second;
-            if (!gameMap.hasTown(a) || !gameMap.hasTown(b))
-                continue;
-
-            // Skip wish if link already made
-            if (activeConnections.count({a, b}) || activeConnections.count({b, a}))
-            {
-                // cerr << "Skipping already active connection: " << a << "-" << b << endl;
-                continue;
-            }
-
-            Coord ac = gameMap.townCoordOf(a);
-            Coord bc = gameMap.townCoordOf(b);
-
-            int cost = gameMap.aStar(ac, bc);
-            // cerr << "Considering wish: " << a << "-" << b << " with cost " << cost << endl;
-
-            if (cost == INT_MAX)
-                continue;
-
-            if (!found || cost < bestCost)
-            {
-                // cerr << "New best wish: " << a << "-" << b << " with cost " << cost << endl;
-                found = true;
-                bestCost = cost;
-                bestA = a;
-                bestB = b;
-            }
-        }
-
-        if (found)
-        {
-            hasTargetPair = true;
-            targetA = gameMap.townCoordOf(bestA);
-            targetB = gameMap.townCoordOf(bestB);
-        }
-        else
-        {
-            hasTargetPair = false;
-        }
     }
 
     void parse()
@@ -489,88 +625,471 @@ public:
         gameMap.readTurnState(cin, activeConnections);
     }
 
-    void gameTurn()
+    // ---- "Rail placement choice"s creation ----
+
+    // For every desired connection not yet built, grow the rail group already
+    // attached to each of the two towns, then take the cheapest (Manhattan)
+    // pair of cells across the two groups. That pair is the choice.
+    static vector<RailChoice> buildRailChoices(const Map &board,
+                                               const vector<pair<int, int>> &wishes,
+                                               const map<pair<int, int>, bool> &active)
     {
-        vector<string> actions;
+        PROFILE(railChoices);
 
-        computeBestWish();
+        vector<RailChoice> choices;
 
-        // --- Aggregate instability / inked / enemy rails per region ---
-        unordered_map<int, int> inst;
-        set<int> inkedRegions;
-        unordered_map<int, int> foeRails;
-
-        gameMap.aggregateRegions(foeId, inst, inkedRegions, foeRails);
-
-        // --- Pick which region to disrupt: one with enemy rails, not yet inked,
-        //     not containing one of our/their towns (can't disrupt those),
-        //     preferring the one closest to being inked / with the most rails.
-        //     The goal is to push a region's instability high enough that it
-        //     gets erased with ink, wiping out every enemy rail inside it. ---
-        vector<int> candidates;
-        for (auto &kv : foeRails)
+        for (const auto &wish : wishes)
         {
-            int r = kv.first;
-            if (inkedRegions.count(r))
+            int a = wish.first, b = wish.second;
+            if (!board.hasTown(a) || !board.hasTown(b))
                 continue;
-            if (gameMap.regionContainsTown(r))
-                continue; // regions with a town can't be disrupted
-            candidates.push_back(r);
-        }
-        set<int> candidateSet(candidates.begin(), candidates.end());
+            // Already built: nothing to place for this wish.
+            if (active.count({a, b}) || active.count({b, a}))
+                continue;
 
-        if (targetRegion != -1 && !candidateSet.count(targetRegion))
-        {
-            targetRegion = -1;
-        }
+            Coord ac = board.townCoordOf(a);
+            Coord bc = board.townCoordOf(b);
 
-        if (!candidates.empty())
-        {
-            auto pickBest = [&](const vector<int> &cands)
+            vector<Coord> groupA = board.railGroupOf(ac);
+            vector<Coord> groupB = board.railGroupOf(bc);
+            if (groupA.empty() || groupB.empty())
+                continue;
+
+            // Cross-product of both groups: keep the shortest link.
+            RailChoice best;
+            for (const Coord &ca : groupA)
             {
-                int best = cands[0];
-                for (int r : cands)
+                for (const Coord &cb : groupB)
                 {
-                    if (make_pair(inst[r], foeRails[r]) > make_pair(inst[best], foeRails[best]))
+                    int d = abs(ca.x - cb.x) + abs(ca.y - cb.y);
+                    if (d < best.distance)
+                        best = RailChoice(ca, cb, d);
+                }
+            }
+
+            // distance 0 means the groups already touch: the connection is
+            // effectively built, nothing to place.
+            if (best.distance != INT_MAX && best.distance > 0)
+                choices.push_back(best);
+        }
+
+        return choices;
+    }
+
+    // ---- "Disrupt choice" creation ----
+
+    // A region is a candidate when it is not inked, holds no town, carries at
+    // least one opponent rail, and — counting unique rails per player across
+    // the active connections running through it — the opponent owns strictly
+    // more than we do. Only the single best region is returned (-1 if none).
+    static int buildDisruptChoice(Map &board,
+                                  const vector<pair<int, int>> &wishes,
+                                  int selfId, int otherId)
+    {
+        PROFILE(disruptChoice);
+
+        // Collect the cells of every currently active connection once.
+        vector<vector<Coord>> connectionPaths;
+        for (const auto &wish : wishes)
+        {
+            int a = wish.first, b = wish.second;
+            if (!board.hasTown(a) || !board.hasTown(b))
+                continue;
+            vector<Coord> path = board.connectionPath(board.townCoordOf(a), board.townCoordOf(b));
+            if (!path.empty())
+                connectionPaths.push_back(move(path));
+        }
+
+        // Per region, count each player's unique rails lying on a connection.
+        unordered_map<int, set<pair<int, int>>> selfCells, otherCells;
+        for (const auto &path : connectionPaths)
+        {
+            for (const Coord &c : path)
+            {
+                if (!board.hasRail(c.x, c.y))
+                    continue;
+                int owner = board.tileOwner(c.x, c.y);
+                int region = board.tileRegion(c.x, c.y);
+                if (owner == selfId)
+                    selfCells[region].insert({c.x, c.y});
+                else if (owner == otherId)
+                    otherCells[region].insert({c.x, c.y});
+            }
+        }
+
+        int best = -1;
+        int bestOtherCount = 0;
+        int bestDiff = 0;
+
+        for (int regionId : board.allRegionIds())
+        {
+            if (board.regionInked(regionId))
+                continue;
+            if (board.regionContainsTown(regionId))
+                continue;
+
+            int otherCount = (int)otherCells[regionId].size();
+            int selfCount = (int)selfCells[regionId].size();
+            if (otherCount == 0)
+                continue; // needs opponent rails
+            if (otherCount <= selfCount)
+                continue; // must hurt them more than us
+
+            int diff = otherCount - selfCount;
+            if (diff > bestDiff || (diff == bestDiff && otherCount > bestOtherCount))
+            {
+                best = regionId;
+                bestDiff = diff;
+                bestOtherCount = otherCount;
+            }
+        }
+
+        return best;
+    }
+
+    // ---- "Rail placement choice" application ----
+
+    // Walks from the choice's source towards its destination, spending the
+    // turn's paint. At each step the neighbour with the smallest A* distance
+    // to the destination wins, ties broken NORTH/EAST/SOUTH/WEST.
+    //
+    // The cells to fill are returned rather than written, so both players'
+    // rails can be applied simultaneously (neutral-owner rule).
+    static vector<Coord> planRailPlacements(const Map &board, const RailChoice &choice)
+    {
+        vector<Coord> placements;
+        if (choice.distance == INT_MAX)
+            return placements;
+
+        // Cells claimed so far this turn, so the walk does not reuse one.
+        set<pair<int, int>> claimed;
+
+        // Distance from every cell to the destination, computed once with a
+        // single Dijkstra from the destination instead of one A* per
+        // candidate neighbour. Costs are symmetric (entering a cell costs the
+        // same either way), so a reverse search gives the same distances at a
+        // fraction of the work — this is the hot path of the whole search.
+        const int W = board.width(), H = board.height();
+        vector<vector<int>> distToDst(H, vector<int>(W, INT_MAX));
+
+        {
+            priority_queue<tuple<int, int, int>, vector<tuple<int, int, int>>, greater<>> pq;
+            distToDst[choice.dst.y][choice.dst.x] = 0;
+            pq.push({0, choice.dst.x, choice.dst.y});
+
+            while (!pq.empty())
+            {
+                auto [d, x, y] = pq.top();
+                pq.pop();
+                if (d > distToDst[y][x])
+                    continue;
+
+                for (int k = 0; k < 4; k++)
+                {
+                    int nx = x + DIR_X[k], ny = y + DIR_Y[k];
+                    if (!board.inBounds(nx, ny))
+                        continue;
+                    // Only cells we could actually build on are traversable.
+                    if (!board.canPlaceRail(nx, ny))
+                        continue;
+
+                    int nd = d + board.railCost(nx, ny);
+                    if (nd < distToDst[ny][nx])
                     {
-                        best = r;
+                        distToDst[ny][nx] = nd;
+                        pq.push({nd, nx, ny});
                     }
                 }
-                return best;
-            };
-
-            if (targetRegion == -1)
-            {
-                targetRegion = pickBest(candidates);
             }
-            else
+        }
+
+        Coord cur = choice.src;
+        int paint = PAINT_PER_TURN;
+
+        while (paint > 0)
+        {
+            int bestK = -1;
+            int bestDist = INT_MAX;
+
+            for (int k = 0; k < 4; k++)
             {
-                int other = pickBest(candidates);
-                // Only switch targets if the other region is clearly further along.
-                if (make_pair(inst[other], foeRails[other]) >
-                    make_pair(inst[targetRegion], foeRails[targetRegion] + 1))
+                int nx = cur.x + DIR_X[k], ny = cur.y + DIR_Y[k];
+                if (!board.inBounds(nx, ny))
+                    continue;
+                if (!board.canPlaceRail(nx, ny) || claimed.count({nx, ny}))
+                    continue;
+                if (board.railCost(nx, ny) > paint)
+                    continue; // not enough paint left for this terrain
+
+                int d = distToDst[ny][nx];
+                if (d == INT_MAX)
+                    continue;
+                // Strictly-less keeps the earlier (higher priority) direction.
+                if (d < bestDist)
                 {
-                    targetRegion = other;
+                    bestDist = d;
+                    bestK = k;
                 }
             }
+
+            if (bestK == -1)
+                break; // nowhere useful left to build
+
+            Coord next(cur.x + DIR_X[bestK], cur.y + DIR_Y[bestK]);
+            paint -= board.railCost(next.x, next.y);
+            claimed.insert({next.x, next.y});
+            placements.push_back(next);
+
+            // Reached the far group: the connection is joined.
+            if (next == choice.dst)
+                break;
+            cur = next;
         }
 
-        if (targetRegion != -1)
-        {
-            actions.push_back("DISRUPT " + to_string(targetRegion));
+        return placements;
+    }
 
+    // ---- heuristic ----
+
+    // Connection points are awarded per turn: each active connection pays a
+    // player 1 point per rail they own along its path. The heuristic is our
+    // income minus the opponent's.
+    static int evaluate(Map &board, const vector<pair<int, int>> &wishes,
+                        int selfId, int otherId)
+    {
+        int selfPoints = 0, otherPoints = 0;
+
+        for (const auto &wish : wishes)
+        {
+            int a = wish.first, b = wish.second;
+            if (!board.hasTown(a) || !board.hasTown(b))
+                continue;
+            vector<Coord> path = board.connectionPath(board.townCoordOf(a), board.townCoordOf(b));
+            if (path.empty())
+                continue;
+
+            for (const Coord &c : path)
+            {
+                int owner = board.tileOwner(c.x, c.y);
+                if (owner == selfId)
+                    selfPoints++;
+                else if (owner == otherId)
+                    otherPoints++;
+            }
+        }
+
+        return selfPoints - otherPoints;
+    }
+
+    // ---- game engine turn application ----
+
+    // Applies both players' rail creations simultaneously, then the disrupts,
+    // then inking, producing state D+1 in place.
+    static void simulateTurn(Map &board,
+                             const vector<Coord> &myRails, const vector<Coord> &foeRails,
+                             int myDisrupt, int foeDisrupt,
+                             int selfId, int otherId)
+    {
+        PROFILE(simulateTurn);
+
+        // Both players place at the same time: a shared tile becomes neutral.
+        for (const Coord &c : myRails)
+            if (board.canPlaceRail(c.x, c.y))
+                board.placeRail(c.x, c.y, selfId);
+        for (const Coord &c : foeRails)
+            if (board.canPlaceRail(c.x, c.y) || board.tileOwner(c.x, c.y) == selfId)
+                board.placeRail(c.x, c.y, otherId);
+
+        // Disrupts raise instability and may ink (erasing the region's rails).
+        if (myDisrupt != -1)
+            board.disruptRegion(myDisrupt);
+        if (foeDisrupt != -1)
+            board.disruptRegion(foeDisrupt);
+    }
+
+    // ---- beam search ----
+
+    class BeamNode
+    {
+    public:
+        Map state;
+        map<pair<int, int>, bool> active;
+        int score;
+        // The rail choice played at the root of this line, i.e. the move we
+        // would actually output this turn.
+        bool hasRootChoice;
+        RailChoice rootChoice;
+        int rootDisrupt;
+
+        BeamNode() : score(0), hasRootChoice(false), rootDisrupt(-1) {}
+    };
+
+    // Runs the beam and returns the move to play this turn.
+    void beamSearch(bool &outHasRail, RailChoice &outRail, int &outDisrupt)
+    {
+        PROFILE(beamSearch);
+
+        outHasRail = false;
+        outDisrupt = -1;
+
+        BeamNode root;
+        root.state = gameMap;
+        root.active = activeConnections;
+        root.score = evaluate(root.state, wishes, myId, foeId);
+
+        vector<BeamNode> beam{root};
+
+        // The beam deepens only while there is time left in the turn: on big
+        // boards a full MAX_DEPTH sweep overruns the limit, so we keep the
+        // best line found so far instead of forfeiting the turn. The first
+        // turn gets the referee's larger allowance.
+        int budgetMs = firstTurn ? FIRST_TURN_BUDGET_MS : TURN_BUDGET_MS;
+        auto deadline = turnStart + std::chrono::milliseconds(budgetMs);
+
+        for (int depth = 0; depth < MAX_DEPTH; depth++)
+        {
+            if (std::chrono::steady_clock::now() >= deadline)
+                break;
+
+            vector<BeamNode> nextBeam;
+
+            for (BeamNode &node : beam)
+            {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    break;
+
+                // 2. Copy current_state in turn_state (node.state is turn_state).
+                // 3. Generate rail choices.
+                vector<RailChoice> railChoices =
+                    buildRailChoices(node.state, wishes, node.active);
+
+                // 4. Generate both players' best disrupt choices.
+                int myDisrupt = buildDisruptChoice(node.state, wishes, myId, foeId);
+                int foeDisrupt = buildDisruptChoice(node.state, wishes, foeId, myId);
+
+                // The opponent replies with their own best (shortest) rail
+                // choice, held fixed across our alternatives.
+                vector<Coord> foeRails;
+                if (!railChoices.empty())
+                {
+                    const RailChoice *foeBest = &railChoices[0];
+                    for (const RailChoice &rc : railChoices)
+                        if (rc.distance < foeBest->distance)
+                            foeBest = &rc;
+                    foeRails = planRailPlacements(node.state, *foeBest);
+                }
+
+                if (railChoices.empty())
+                {
+                    // No rail to build: still simulate disrupts so the line
+                    // keeps evolving.
+                    BeamNode child;
+                    child.state = node.state;
+                    child.active = node.active;
+                    child.hasRootChoice = node.hasRootChoice;
+                    child.rootChoice = node.rootChoice;
+                    child.rootDisrupt = (depth == 0) ? myDisrupt : node.rootDisrupt;
+
+                    simulateTurn(child.state, {}, foeRails, myDisrupt, foeDisrupt, myId, foeId);
+                    child.score = evaluate(child.state, wishes, myId, foeId);
+                    nextBeam.push_back(move(child));
+                    continue;
+                }
+
+                // 7. Iterate over rail choices.
+                for (const RailChoice &choice : railChoices)
+                {
+                    // Expanding a choice is the expensive step, so the budget
+                    // is checked here too rather than once per node.
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        break;
+
+                    BeamNode child;
+                    child.state = node.state; // copy turn_state
+                    child.active = node.active;
+
+                    if (depth == 0)
+                    {
+                        child.hasRootChoice = true;
+                        child.rootChoice = choice;
+                        child.rootDisrupt = myDisrupt;
+                    }
+                    else
+                    {
+                        child.hasRootChoice = node.hasRootChoice;
+                        child.rootChoice = node.rootChoice;
+                        child.rootDisrupt = node.rootDisrupt;
+                    }
+
+                    vector<Coord> myRails = planRailPlacements(child.state, choice);
+                    simulateTurn(child.state, myRails, foeRails, myDisrupt, foeDisrupt,
+                                 myId, foeId);
+                    child.score = evaluate(child.state, wishes, myId, foeId);
+
+                    nextBeam.push_back(move(child));
+                }
+            }
+
+            if (nextBeam.empty())
+                break;
+
+            // 8. Keep the Bwidth best states.
+            sort(nextBeam.begin(), nextBeam.end(),
+                 [](const BeamNode &a, const BeamNode &b)
+                 { return a.score > b.score; });
+            if ((int)nextBeam.size() > BEAM_WIDTH)
+                nextBeam.resize(BEAM_WIDTH);
+
+            beam = move(nextBeam);
+        }
+
+        if (!beam.empty())
+        {
+            const BeamNode &best = beam.front();
+            outHasRail = best.hasRootChoice;
+            outRail = best.rootChoice;
+            outDisrupt = best.rootDisrupt;
+        }
+    }
+
+    void gameTurn()
+    {
+        // Timed from after the input read, so blocking on stdin does not
+        // count against the search budget.
+        turnStart = std::chrono::steady_clock::now();
+
+        bool hasRail = false;
+        RailChoice rail;
+        int disrupt = -1;
+
+        beamSearch(hasRail, rail, disrupt);
+
+        vector<string> actions;
+
+        // The engine resolves every PLACE_TRACKS before any DISRUPT, so the
+        // commands are emitted in that same order.
+        int placed = 0;
+        if (hasRail)
+        {
+            // Turn the chosen link into concrete rail placements for this turn.
+            vector<Coord> placements = planRailPlacements(gameMap, rail);
+            for (const Coord &c : placements)
+            {
+                actions.push_back("PLACE_TRACKS " + to_string(c.x) + " " + to_string(c.y));
+            }
+            placed = (int)placements.size();
+        }
+
+        if (disrupt != -1)
+            actions.push_back("DISRUPT " + to_string(disrupt));
+
+        if (!actions.empty())
+        {
             stringstream msg;
-            msg << "MESSAGE R" << targetRegion << " inst " << inst[targetRegion]
-                << " (" << foeRails[targetRegion] << " rails)";
+            msg << "MESSAGE " << placed << " rails";
+            if (disrupt != -1)
+                msg << " D" << disrupt;
             actions.push_back(msg.str());
-        }
-
-        if (hasTargetPair)
-        {
-            stringstream ap;
-            ap << "AUTOPLACE " << targetA.x << " " << targetA.y << " "
-               << targetB.x << " " << targetB.y;
-            actions.push_back(ap.str());
         }
 
         if (!actions.empty())
@@ -587,6 +1106,8 @@ public:
         {
             cout << "WAIT\n";
         }
+
+        firstTurn = false;
     }
 };
 
@@ -607,6 +1128,9 @@ int main()
         mainLoopturn(game);
 
         PRINT_PROFILE(mainLoopturn);
+        PRINT_PROFILE(beamSearch);
+        PRINT_PROFILE(railChoices);
+        PRINT_PROFILE(disruptChoice);
+        PRINT_PROFILE(simulateTurn);
     }
-    cout << "prout" << endl;
 }
