@@ -932,51 +932,141 @@ public:
 };
 
 // ====================
-// GAME
+// BEAM SEARCH STATE
 
-class Game
+// Per-turn beam search statistics, printed to stderr at the end of the
+// turn. Reset by BeamSearch::run() on every call.
+class BeamStats
 {
 public:
-    int myId;
-    int foeId;
-    Map gameMap;
+    // Deepest depth level actually expanded. The current state is depth 0,
+    // so a value of N means N plies were simulated beyond it.
+    int maxDepth;
+    // Every child state created this turn, across all depths.
+    int totalStates;
 
-    // Shared by every simulated Map, so paths are computed once per terrain
-    // state instead of once per beam node.
-    PathTable pathTable;
+    // Per depth:
+    //  - actionsCreated : action sets buildRailChoices() proposed. Every
+    //                     one of them is expanded.
+    //  - statesPerDepth : child states produced, before the Bwidth cut.
+    vector<int> actionsCreated;
+    vector<int> statesPerDepth;
+    // Nodes whose expansion was cut short by the time budget.
+    int truncatedByTime;
 
-    int myScore, foeScore;
+    BeamStats() { reset(); }
 
-    // wishes: pairs of town ids that want to be connected
-    vector<pair<int, int>> wishes;
-    // activeConnections: pairs of town ids being connected
-    map<pair<int, int>, bool> activeConnections;
-
-    // Start of the current turn, used to bound the search.
-    std::chrono::steady_clock::time_point turnStart;
-    // The first turn has a far larger time allowance than the others.
-    bool firstTurn = true;
-
-    void init()
+    void reset()
     {
-        cin >> myId;
-        foeId = 1 - myId;
-        gameMap.readTerrain(cin);
-        pathTable.init(gameMap.width(), gameMap.height());
-        gameMap.setPathTable(&pathTable);
-        activeConnections.clear();
-        gameMap.readTowns(cin, wishes);
+        maxDepth = 0;
+        totalStates = 0;
+        truncatedByTime = 0;
+        actionsCreated.assign(MAX_DEPTH, 0);
+        statesPerDepth.assign(MAX_DEPTH, 0);
     }
 
-    void parse()
+    int totalActionsCreated() const
     {
-        cin >> myScore;
+        int sum = 0;
+        for (int d = 0; d < maxDepth; d++)
+            sum += actionsCreated[d];
+        return sum;
+    }
 
-        turnStart = std::chrono::steady_clock::now();
+    // Mean number of action sets generated per state expanded, i.e. the
+    // raw branching factor before it is capped. The states expanded at a
+    // depth are the ones the previous depth produced, capped by the beam
+    // width; depth 0 expands the single root.
+    double avgActionsPerState() const
+    {
+        int states = 0;
+        for (int d = 0; d < maxDepth; d++)
+            states += (d == 0) ? 1 : min(statesPerDepth[d - 1], BEAM_WIDTH);
+        if (states == 0)
+            return 0.0;
+        return (double)totalActionsCreated() / states;
+    }
 
-        cin >> foeScore;
-        activeConnections.clear();
-        gameMap.readTurnState(cin, activeConnections);
+    void print() const
+    {
+        fprintf(stderr, "%-32s max depth : %d / %d  (current state = depth 0)\n",
+                "beamStats", maxDepth, MAX_DEPTH);
+        fprintf(stderr, "%-32s avg actions / state : %.2f\n", "beamStats",
+                avgActionsPerState());
+        fprintf(stderr, "%-32s action sets created : %d\n", "beamStats",
+                totalActionsCreated());
+        fprintf(stderr, "%-32s total states : %d\n", "beamStats", totalStates);
+        if (truncatedByTime)
+            fprintf(stderr, "%-32s time-truncated expansions : %d\n", "beamStats",
+                    truncatedByTime);
+
+        fprintf(stderr, "%-32s %-7s %10s %14s\n", "beamStats",
+                "depth", "actionsets generated", "states created");
+        for (int d = 0; d < maxDepth; d++)
+            fprintf(stderr, "%-32s %-7d %10d %14d\n", "beamStats",
+                    d + 1, actionsCreated[d], statesPerDepth[d]);
+    }
+};
+
+class BeamNode
+{
+public:
+    Map state;
+    map<pair<int, int>, bool> active;
+    int score;
+    // Points banked along this line: every simulated turn adds what each
+    // player earned from the connections active at that moment, the way
+    // the referee pays them out. `turns` is how many turns produced them,
+    // used to keep lines of different depths comparable.
+    int bankedSelf, bankedOther;
+    int turns;
+    // The rail choice played at the root of this line, i.e. the move we
+    // would actually output this turn.
+    bool hasRootChoice;
+    RailChoice rootChoice;
+    int rootDisrupt;
+
+    BeamNode()
+        : score(0), bankedSelf(0), bankedOther(0), turns(0),
+          hasRootChoice(false), rootDisrupt(-1) {}
+};
+
+// ====================
+// BEAM SEARCH
+
+// The search itself. Game hands it the turn's starting position through
+// setup(), run() explores forward from it, and the best line's root move is
+// what Game plays. Everything the search needs to score and advance a state
+// lives here; Game keeps only the I/O and the real board.
+class BeamSearch
+{
+public:
+    // ---- position under search, set once per turn by setup() ----
+    int myId = 0;
+    int foeId = 0;
+    // The turn's real position. Only ever read, to seed the root node, which
+    // takes its own copy: the search never mutates the caller's board.
+    const Map *startBoard = nullptr;
+    map<pair<int, int>, bool> startActive;
+    vector<pair<int, int>> wishes;
+    // Turn clock, so the search can stop before the referee's limit.
+    std::chrono::steady_clock::time_point turnStart;
+    bool firstTurn = true;
+
+    BeamStats stats;
+
+    void setup(int selfId, int otherId, const Map &turnBoard,
+               const map<pair<int, int>, bool> &turnActive,
+               const vector<pair<int, int>> &turnWishes,
+               std::chrono::steady_clock::time_point start, bool isFirstTurn)
+    {
+        myId = selfId;
+        foeId = otherId;
+        startBoard = &turnBoard;
+        startActive = turnActive;
+        wishes = turnWishes;
+        turnStart = start;
+        firstTurn = isFirstTurn;
     }
 
     // ---- rail group linking ----
@@ -1338,107 +1428,6 @@ public:
         return income - GAP_PENALTY * openGapTotal(board, wishes);
     }
 
-    // ---- beam search ----
-
-    // Per-turn beam search statistics, printed to stderr at the end of the
-    // turn. Reset by beamSearch() on every call.
-    class BeamStats
-    {
-    public:
-        // Deepest depth level actually expanded. The current state is depth 0,
-        // so a value of N means N plies were simulated beyond it.
-        int maxDepth;
-        // Every child state created this turn, across all depths.
-        int totalStates;
-
-        // Per depth:
-        //  - actionsCreated : action sets buildRailChoices() proposed. Every
-        //                     one of them is expanded.
-        //  - statesPerDepth : child states produced, before the Bwidth cut.
-        vector<int> actionsCreated;
-        vector<int> statesPerDepth;
-        // Nodes whose expansion was cut short by the time budget.
-        int truncatedByTime;
-
-        BeamStats() { reset(); }
-
-        void reset()
-        {
-            maxDepth = 0;
-            totalStates = 0;
-            truncatedByTime = 0;
-            actionsCreated.assign(MAX_DEPTH, 0);
-            statesPerDepth.assign(MAX_DEPTH, 0);
-        }
-
-        int totalActionsCreated() const
-        {
-            int sum = 0;
-            for (int d = 0; d < maxDepth; d++)
-                sum += actionsCreated[d];
-            return sum;
-        }
-
-        // Mean number of action sets generated per state expanded, i.e. the
-        // raw branching factor before it is capped. The states expanded at a
-        // depth are the ones the previous depth produced, capped by the beam
-        // width; depth 0 expands the single root.
-        double avgActionsPerState() const
-        {
-            int states = 0;
-            for (int d = 0; d < maxDepth; d++)
-                states += (d == 0) ? 1 : min(statesPerDepth[d - 1], BEAM_WIDTH);
-            if (states == 0)
-                return 0.0;
-            return (double)totalActionsCreated() / states;
-        }
-
-        void print() const
-        {
-            fprintf(stderr, "%-32s max depth : %d / %d  (current state = depth 0)\n",
-                    "beamStats", maxDepth, MAX_DEPTH);
-            fprintf(stderr, "%-32s avg actions / state : %.2f\n", "beamStats",
-                    avgActionsPerState());
-            fprintf(stderr, "%-32s action sets created : %d\n", "beamStats",
-                    totalActionsCreated());
-            fprintf(stderr, "%-32s total states : %d\n", "beamStats", totalStates);
-            if (truncatedByTime)
-                fprintf(stderr, "%-32s time-truncated expansions : %d\n", "beamStats",
-                        truncatedByTime);
-
-            fprintf(stderr, "%-32s %-7s %10s %14s\n", "beamStats",
-                    "depth", "actionsets generated", "states created");
-            for (int d = 0; d < maxDepth; d++)
-                fprintf(stderr, "%-32s %-7d %10d %14d\n", "beamStats",
-                        d + 1, actionsCreated[d], statesPerDepth[d]);
-        }
-    };
-
-    BeamStats beamStats;
-
-    class BeamNode
-    {
-    public:
-        Map state;
-        map<pair<int, int>, bool> active;
-        int score;
-        // Points banked along this line: every simulated turn adds what each
-        // player earned from the connections active at that moment, the way
-        // the referee pays them out. `turns` is how many turns produced them,
-        // used to keep lines of different depths comparable.
-        int bankedSelf, bankedOther;
-        int turns;
-        // The rail choice played at the root of this line, i.e. the move we
-        // would actually output this turn.
-        bool hasRootChoice;
-        RailChoice rootChoice;
-        int rootDisrupt;
-
-        BeamNode()
-            : score(0), bankedSelf(0), bankedOther(0), turns(0),
-              hasRootChoice(false), rootDisrupt(-1) {}
-    };
-
     // ---- game engine turn application ----
 
     // Plays one full turn on `child`, which starts as a copy of `parent`:
@@ -1485,17 +1474,17 @@ public:
     }
 
     // Runs the beam and returns the move to play this turn.
-    void beamSearch(bool &outHasRail, RailChoice &outRail, int &outDisrupt)
+    void run(bool &outHasRail, RailChoice &outRail, int &outDisrupt)
     {
         PROFILE(beamSearch);
 
         outHasRail = false;
         outDisrupt = -1;
-        beamStats.reset();
+        stats.reset();
 
         BeamNode root;
-        root.state = gameMap;
-        root.active = activeConnections;
+        root.state = *startBoard;
+        root.active = startActive;
         // Nothing simulated yet, so nothing banked: the root is judged on its
         // open gaps alone.
         root.score = evaluate(root.state, wishes, 0, 0, 0);
@@ -1536,7 +1525,7 @@ public:
             {
                 if (std::chrono::steady_clock::now() >= deadline)
                 {
-                    beamStats.truncatedByTime++;
+                    stats.truncatedByTime++;
                     depthComplete = false;
                     break;
                 }
@@ -1550,7 +1539,7 @@ public:
                 // alone. Checked again after the setup, below.
                 vector<RailChoice> railChoices =
                     buildRailChoices(node.state, wishes, node.active);
-                beamStats.actionsCreated[depth] += (int)railChoices.size();
+                stats.actionsCreated[depth] += (int)railChoices.size();
 
                 // 4. Generate both players' best disrupt choices.
                 int myDisrupt = buildDisruptChoice(node.state, wishes, myId, foeId);
@@ -1572,7 +1561,7 @@ public:
                 // depth: bail out here rather than starting to expand.
                 if (std::chrono::steady_clock::now() >= deadline)
                 {
-                    beamStats.truncatedByTime++;
+                    stats.truncatedByTime++;
                     depthComplete = false;
                     break;
                 }
@@ -1611,7 +1600,7 @@ public:
                     // is checked here too rather than once per node.
                     if (std::chrono::steady_clock::now() >= deadline)
                     {
-                        beamStats.truncatedByTime++;
+                        stats.truncatedByTime++;
                         depthComplete = false;
                         break;
                     }
@@ -1649,14 +1638,14 @@ public:
 
             // Every child built at this depth counts as a state encountered,
             // even the ones the Bwidth cut discards below.
-            beamStats.statesPerDepth[depth] = (int)nextBeam.size();
-            beamStats.totalStates += (int)nextBeam.size();
+            stats.statesPerDepth[depth] = (int)nextBeam.size();
+            stats.totalStates += (int)nextBeam.size();
 
             if (nextBeam.empty())
                 break;
 
             // This depth produced states, so it counts as expanded.
-            beamStats.maxDepth = depth + 1;
+            stats.maxDepth = depth + 1;
 
             // 8. Keep the Bwidth best states.
             //
@@ -1695,6 +1684,59 @@ public:
         }
     }
 
+};
+
+// ====================
+// GAME
+
+class Game
+{
+public:
+    int myId;
+    int foeId;
+    Map gameMap;
+
+    // Shared by every simulated Map, so paths are computed once per terrain
+    // state instead of once per beam node.
+    PathTable pathTable;
+
+    int myScore, foeScore;
+
+    // wishes: pairs of town ids that want to be connected
+    vector<pair<int, int>> wishes;
+    // activeConnections: pairs of town ids being connected
+    map<pair<int, int>, bool> activeConnections;
+
+    // The search, reused across turns so its buffers survive.
+    BeamSearch beam;
+
+    // Start of the current turn, used to bound the search.
+    std::chrono::steady_clock::time_point turnStart;
+    // The first turn has a far larger time allowance than the others.
+    bool firstTurn = true;
+
+    void init()
+    {
+        cin >> myId;
+        foeId = 1 - myId;
+        gameMap.readTerrain(cin);
+        pathTable.init(gameMap.width(), gameMap.height());
+        gameMap.setPathTable(&pathTable);
+        activeConnections.clear();
+        gameMap.readTowns(cin, wishes);
+    }
+
+    void parse()
+    {
+        cin >> myScore;
+
+        turnStart = std::chrono::steady_clock::now();
+
+        cin >> foeScore;
+        activeConnections.clear();
+        gameMap.readTurnState(cin, activeConnections);
+    }
+
     void gameTurn()
     {
         pathTable.resetStats();
@@ -1703,7 +1745,9 @@ public:
         RailChoice rail;
         int disrupt = -1;
 
-        beamSearch(hasRail, rail, disrupt);
+        beam.setup(myId, foeId, gameMap, activeConnections, wishes,
+                   turnStart, firstTurn);
+        beam.run(hasRail, rail, disrupt);
 
         vector<string> actions;
 
@@ -1713,7 +1757,7 @@ public:
         if (hasRail)
         {
             // Turn the chosen link into concrete rail placements for this turn.
-            vector<Coord> placements = planRailPlacements(gameMap, rail);
+            vector<Coord> placements = BeamSearch::planRailPlacements(gameMap, rail);
             for (const Coord &c : placements)
             {
                 actions.push_back("PLACE_TRACKS " + to_string(c.x) + " " + to_string(c.y));
@@ -1768,7 +1812,7 @@ int main()
     {
         mainLoopturn(game);
 
-        game.beamStats.print();
+        game.beam.stats.print();
         fprintf(stderr, "%-32s path LT : %d hits / %d misses, fields %d/%d, "
                         "%d invalidated, %d cached\n",
                 "pathTable", game.pathTable.hits, game.pathTable.misses,
