@@ -44,11 +44,21 @@ public:
     }
 };
 
+// Set to 0 for competition builds: on the hottest helpers the two
+// steady_clock reads per call cost more than the work being measured.
+#ifndef ENABLE_PROFILING
+#define ENABLE_PROFILING 1
+#endif
+
 #define DECLARE_PROFILE(name) \
     int callcount_##name = 0; \
     int elapsed_##name = 0;
 
+#if ENABLE_PROFILING
 #define PROFILE(name) ProfileScope _ps_##name(callcount_##name, elapsed_##name)
+#else
+#define PROFILE(name) ((void)0)
+#endif
 
 #define PRINT_PROFILE(name)                                                                                                                                                                             \
     do                                                                                                                                                                                                  \
@@ -63,11 +73,21 @@ DECLARE_PROFILE(beamSearch)
 DECLARE_PROFILE(railChoices)
 DECLARE_PROFILE(disruptChoice)
 DECLARE_PROFILE(simulateTurn)
+DECLARE_PROFILE(evaluate)
+DECLARE_PROFILE(planRails)
+DECLARE_PROFILE(connectionPath)
+DECLARE_PROFILE(railGroupOf)
+DECLARE_PROFILE(stateCopy)
 
 // ====================
 // CONSTANTS
 
 static const int BEAM_WIDTH = 20;
+// Upper bound on how many action sets one state expands into. It exists for
+// responsiveness, not for pruning quality: the deadline is only tested
+// between choices, so an uncapped node (~70 choices here) runs ~90 ms past
+// the budget before the search can react. Set to 0 to disable.
+static const int MAX_BRANCHING = 0;
 static const int MAX_DEPTH = 10;
 static const int PAINT_PER_TURN = 3;
 
@@ -75,8 +95,8 @@ static const int PAINT_PER_TURN = 3;
 // (1000 ms on the first). The deadline is only tested between expansions, so
 // the budget stays well under the limit to absorb one in-flight expansion
 // plus the final replay and output.
-static const int TURN_BUDGET_MS = 20;
-static const int FIRST_TURN_BUDGET_MS = 700;
+static const int TURN_BUDGET_MS = 30;
+static const int FIRST_TURN_BUDGET_MS = 30;
 
 // Owner marker for a tile carrying no rail.
 static const int NO_OWNER = -1;
@@ -454,6 +474,33 @@ public:
 // future state, so it stays a plain value type.
 class Map
 {
+public:
+    Map() {}
+
+    // Copying a Map happens once per beam child, so the scratch buffers are
+    // deliberately left behind: they carry no value, only working space, and
+    // copying them was pure overhead. Each copy lazily rebuilds its own.
+    Map(const Map &o)
+        : grid(o.grid), towns(o.towns), regionById(o.regionById),
+          townCoord(o.townCoord), townCellFlag(o.townCellFlag),
+          regionHasTown(o.regionHasTown), pathTable(o.pathTable) {}
+
+    Map &operator=(const Map &o)
+    {
+        if (this != &o)
+        {
+            grid = o.grid;
+            towns = o.towns;
+            regionById = o.regionById;
+            townCoord = o.townCoord;
+            townCellFlag = o.townCellFlag;
+            regionHasTown = o.regionHasTown;
+            pathTable = o.pathTable;
+            // scratch* intentionally not copied.
+        }
+        return *this;
+    }
+
 private:
     Grid grid;
     vector<Town> towns;
@@ -461,8 +508,9 @@ private:
 
     // quick lookup: town id -> coord
     unordered_map<int, Coord> townCoord;
-    // set of cells that contain a town
-    set<pair<int, int>> townCells;
+    // Flat per-cell town flag. A set<pair> lookup here cost a tree walk and
+    // was hit millions of times per turn from the path/group scans.
+    vector<char> townCellFlag;
 
     // Lookup table: regionId -> does this region contain a town?
     unordered_map<int, bool> regionHasTown;
@@ -470,6 +518,25 @@ private:
     // Shared path cache. Not owned: every simulated Map points at the same
     // table, so a Map copy stays cheap and the cache is filled once.
     PathTable *pathTable = nullptr;
+
+    // Scratch space for the BFS helpers. Mutable and deliberately excluded
+    // from the Map's value: copying a beam state must not copy these.
+    mutable vector<int> scratchSeen;
+    mutable vector<int> scratchParent;
+    mutable vector<int> scratchQueue;
+    mutable int scratchStamp = 0;
+
+    void ensureScratch() const
+    {
+        const size_t n = (size_t)grid.width * grid.height;
+        if (scratchSeen.size() != n)
+        {
+            scratchSeen.assign(n, 0);
+            scratchParent.assign(n, -1);
+            scratchQueue.reserve(n);
+            scratchStamp = 0;
+        }
+    }
 
     Region &getRegionAt(int x, int y)
     {
@@ -498,6 +565,7 @@ public:
         int w, h;
         in >> w >> h;
         grid = Grid(w, h);
+        townCellFlag.assign(w * h, 0);
         regionById.clear();
 
         for (int y = 0; y < h; y++)
@@ -539,7 +607,7 @@ public:
             getRegionAt(townX, townY).hasTown = true;
 
             townCoord[townId] = Coord(townX, townY);
-            townCells.insert({townX, townY});
+            townCellFlag[townY * grid.width + townX] = 1;
 
             for (int other : desired)
             {
@@ -619,7 +687,7 @@ public:
     int tileRegion(int x, int y) const { return grid.get(x, y).regionId; }
     bool tileInked(int x, int y) const { return grid.get(x, y).inked; }
 
-    bool isTownCell(int x, int y) const { return townCells.count({x, y}) != 0; }
+    bool isTownCell(int x, int y) const { return townCellFlag[y * grid.width + x] != 0; }
     bool hasRail(int x, int y) const { return grid.get(x, y).tracksOwner != NO_OWNER; }
 
     // A rail can be placed only on an empty, non-town, passable tile whose
@@ -736,29 +804,40 @@ public:
     // towns. This is the "rail group connected to the town" of the spec.
     vector<Coord> railGroupOf(Coord townCell) const
     {
+        PROFILE(railGroupOf);
         vector<Coord> group;
         if (!inBounds(townCell.x, townCell.y))
             return group;
 
-        vector<vector<bool>> seen(grid.height, vector<bool>(grid.width, false));
-        vector<Coord> stack{townCell};
-        seen[townCell.y][townCell.x] = true;
+        const int W = grid.width, H = grid.height;
+        ensureScratch();
+        scratchStamp++;
+        const int stamp = scratchStamp;
 
-        while (!stack.empty())
+        // Reuses the shared flood-fill scratch: same generation-stamp trick
+        // as connectionPathInto, so no allocation per call.
+        scratchQueue.clear();
+        scratchQueue.push_back(townCell.y * W + townCell.x);
+        scratchSeen[townCell.y * W + townCell.x] = stamp;
+
+        for (size_t head = 0; head < scratchQueue.size(); head++)
         {
-            Coord cur = stack.back();
-            stack.pop_back();
-            group.push_back(cur);
+            const int curIdx = scratchQueue[head];
+            const int cx = curIdx % W, cy = curIdx / W;
+            group.push_back(Coord(cx, cy));
 
             for (int k = 0; k < 4; k++)
             {
-                int nx = cur.x + DIR_X[k], ny = cur.y + DIR_Y[k];
-                if (!inBounds(nx, ny) || seen[ny][nx])
+                const int nx = cx + DIR_X[k], ny = cy + DIR_Y[k];
+                if (nx < 0 || nx >= W || ny < 0 || ny >= H)
+                    continue;
+                const int nIdx = ny * W + nx;
+                if (scratchSeen[nIdx] == stamp)
                     continue;
                 if (!isConnectable(nx, ny))
                     continue;
-                seen[ny][nx] = true;
-                stack.push_back(Coord(nx, ny));
+                scratchSeen[nIdx] = stamp;
+                scratchQueue.push_back(nIdx);
             }
         }
         return group;
@@ -770,52 +849,72 @@ public:
     // NORTH/EAST/SOUTH/WEST tie-break. Empty if the towns are not linked.
     vector<Coord> connectionPath(Coord from, Coord to) const
     {
+        vector<Coord> path;
+        connectionPathInto(from, to, path);
+        return path;
+    }
+
+    // Same BFS, writing into a caller-owned buffer. The scratch state lives
+    // in the Map (mutable, not part of its value) so the hot callers below
+    // pay no allocation at all: this runs hundreds of thousands of times per
+    // turn and the per-call vector<vector<>> pair used to dominate the turn.
+    void connectionPathInto(Coord from, Coord to, vector<Coord> &path) const
+    {
+        PROFILE(connectionPath);
+        path.clear();
         if (!inBounds(from.x, from.y) || !inBounds(to.x, to.y))
-            return {};
+            return;
 
-        vector<vector<int>> dist(grid.height, vector<int>(grid.width, INT_MAX));
-        vector<vector<Coord>> parent(grid.height, vector<Coord>(grid.width, Coord(-1, -1)));
+        const int W = grid.width, H = grid.height;
+        ensureScratch();
+        // A generation stamp replaces clearing the visited array each call.
+        scratchStamp++;
+        const int stamp = scratchStamp;
 
-        queue<Coord> q;
-        dist[from.y][from.x] = 0;
-        q.push(from);
+        const int fromIdx = from.y * W + from.x;
+        const int toIdx = to.y * W + to.x;
 
-        while (!q.empty())
+        scratchSeen[fromIdx] = stamp;
+        scratchParent[fromIdx] = -1;
+
+        scratchQueue.clear();
+        scratchQueue.push_back(fromIdx);
+
+        bool found = (fromIdx == toIdx);
+        for (size_t head = 0; head < scratchQueue.size() && !found; head++)
         {
-            Coord cur = q.front();
-            q.pop();
-            if (cur == to)
-                break;
+            const int curIdx = scratchQueue[head];
+            const int cx = curIdx % W, cy = curIdx / W;
 
             // Neighbours are visited in NORTH/EAST/SOUTH/WEST order, so the
             // first parent recorded for a cell already follows the priority.
             for (int k = 0; k < 4; k++)
             {
-                int nx = cur.x + DIR_X[k], ny = cur.y + DIR_Y[k];
-                if (!inBounds(nx, ny))
+                const int nx = cx + DIR_X[k], ny = cy + DIR_Y[k];
+                if (nx < 0 || nx >= W || ny < 0 || ny >= H)
                     continue;
-                if (dist[ny][nx] != INT_MAX)
+                const int nIdx = ny * W + nx;
+                if (scratchSeen[nIdx] == stamp)
                     continue;
                 if (!isConnectable(nx, ny))
                     continue;
-                dist[ny][nx] = dist[cur.y][cur.x] + 1;
-                parent[ny][nx] = cur;
-                q.push(Coord(nx, ny));
+                scratchSeen[nIdx] = stamp;
+                scratchParent[nIdx] = curIdx;
+                if (nIdx == toIdx)
+                {
+                    found = true;
+                    break;
+                }
+                scratchQueue.push_back(nIdx);
             }
         }
 
-        if (dist[to.y][to.x] == INT_MAX)
-            return {};
+        if (!found)
+            return;
 
-        vector<Coord> path;
-        for (Coord cur = to; cur != Coord(-1, -1); cur = parent[cur.y][cur.x])
-        {
-            path.push_back(cur);
-            if (cur == from)
-                break;
-        }
+        for (int cur = toIdx; cur != -1; cur = scratchParent[cur])
+            path.push_back(Coord(cur % W, cur / W));
         reverse(path.begin(), path.end());
-        return path;
     }
 };
 
@@ -872,6 +971,9 @@ public:
     void parse()
     {
         cin >> myScore;
+
+        turnStart = std::chrono::steady_clock::now();
+
         cin >> foeScore;
         activeConnections.clear();
         gameMap.readTurnState(cin, activeConnections);
@@ -1009,6 +1111,7 @@ public:
     // rails can be applied simultaneously (neutral-owner rule).
     static vector<Coord> planRailPlacements(const Map &board, const RailChoice &choice)
     {
+        PROFILE(planRails);
         vector<Coord> placements;
         if (choice.distance == INT_MAX)
             return placements;
@@ -1142,6 +1245,7 @@ public:
     static int evaluate(Map &board, const vector<pair<int, int>> &wishes,
                         int selfId, int otherId)
     {
+        PROFILE(evaluate);
         int selfPoints = 0, otherPoints = 0;
 
         for (const auto &wish : wishes)
@@ -1199,13 +1303,17 @@ public:
     class BeamStats
     {
     public:
-        // Deepest depth level actually expanded (0 = none completed).
+        // Deepest depth level actually expanded. The current state is depth 0,
+        // so a value of N means N plies were simulated beyond it.
         int maxDepth;
         // Every child state created this turn, across all depths.
         int totalStates;
-        // Actions (rail choices) generated per depth, and how many depths
-        // contributed, so the average can be reported per depth.
-        vector<int> actionsPerDepth;
+
+        // Per depth:
+        //  - actionsCreated : action sets buildRailChoices() proposed. Every
+        //                     one of them is expanded.
+        //  - statesPerDepth : child states produced, before the Bwidth cut.
+        vector<int> actionsCreated;
         vector<int> statesPerDepth;
         // Nodes whose expansion was cut short by the time budget.
         int truncatedByTime;
@@ -1217,33 +1325,50 @@ public:
             maxDepth = 0;
             totalStates = 0;
             truncatedByTime = 0;
-            actionsPerDepth.assign(MAX_DEPTH, 0);
+            actionsCreated.assign(MAX_DEPTH, 0);
             statesPerDepth.assign(MAX_DEPTH, 0);
         }
 
-        // Mean number of actions generated per expanded depth.
-        double avgActionsPerDepth() const
+        int totalActionsCreated() const
         {
-            if (maxDepth == 0)
-                return 0.0;
             int sum = 0;
             for (int d = 0; d < maxDepth; d++)
-                sum += actionsPerDepth[d];
-            return (double)sum / maxDepth;
+                sum += actionsCreated[d];
+            return sum;
+        }
+
+        // Mean number of action sets generated per state expanded, i.e. the
+        // raw branching factor before it is capped. The states expanded at a
+        // depth are the ones the previous depth produced, capped by the beam
+        // width; depth 0 expands the single root.
+        double avgActionsPerState() const
+        {
+            int states = 0;
+            for (int d = 0; d < maxDepth; d++)
+                states += (d == 0) ? 1 : min(statesPerDepth[d - 1], BEAM_WIDTH);
+            if (states == 0)
+                return 0.0;
+            return (double)totalActionsCreated() / states;
         }
 
         void print() const
         {
-            fprintf(stderr, "%-32s max depth : %d / %d\n", "beamStats", maxDepth, MAX_DEPTH);
+            fprintf(stderr, "%-32s max depth : %d / %d  (current state = depth 0)\n",
+                    "beamStats", maxDepth, MAX_DEPTH);
+            fprintf(stderr, "%-32s avg actions / state : %.2f\n", "beamStats",
+                    avgActionsPerState());
+            fprintf(stderr, "%-32s action sets created : %d\n", "beamStats",
+                    totalActionsCreated());
             fprintf(stderr, "%-32s total states : %d\n", "beamStats", totalStates);
-            fprintf(stderr, "%-32s avg actions/depth : %.2f\n", "beamStats",
-                    avgActionsPerDepth());
             if (truncatedByTime)
                 fprintf(stderr, "%-32s time-truncated expansions : %d\n", "beamStats",
                         truncatedByTime);
+
+            fprintf(stderr, "%-32s %-7s %10s %14s\n", "beamStats",
+                    "depth", "actionsets generated", "states created");
             for (int d = 0; d < maxDepth; d++)
-                fprintf(stderr, "%-32s   depth %-2d : %d actions, %d states\n", "beamStats",
-                        d, actionsPerDepth[d], statesPerDepth[d]);
+                fprintf(stderr, "%-32s %-7d %10d %14d\n", "beamStats",
+                        d + 1, actionsCreated[d], statesPerDepth[d]);
         }
     };
 
@@ -1285,7 +1410,21 @@ public:
         // best line found so far instead of forfeiting the turn. The first
         // turn gets the referee's larger allowance.
         int budgetMs = firstTurn ? FIRST_TURN_BUDGET_MS : TURN_BUDGET_MS;
-        auto deadline = turnStart + std::chrono::milliseconds(budgetMs);
+        // The deadline can only be tested between expansions, so the search
+        // always overruns it by whatever the expansion in flight still had to
+        // do. That was measured at ~3 ms here, so the target is pulled in by
+        // that much to make TURN_BUDGET_MS the bound actually observed.
+        static const int IN_FLIGHT_MARGIN_MS = 3;
+        auto deadline = turnStart + std::chrono::milliseconds(budgetMs) -
+                        std::chrono::milliseconds(IN_FLIGHT_MARGIN_MS);
+
+        // A depth no longer has to fit entirely in the remaining time: it is
+        // always entered, and abandoned mid-way when the deadline hits. The
+        // states it did produce are still usable, because evaluate() scores a
+        // board in absolute terms at any depth, so a partial depth's children
+        // can be compared directly against the previous depth's survivors.
+        // Whether a depth completed decides how its states are used below.
+        bool depthComplete = true;
 
         for (int depth = 0; depth < MAX_DEPTH; depth++)
         {
@@ -1293,20 +1432,27 @@ public:
                 break;
 
             vector<BeamNode> nextBeam;
+            depthComplete = true;
 
             for (BeamNode &node : beam)
             {
                 if (std::chrono::steady_clock::now() >= deadline)
                 {
                     beamStats.truncatedByTime++;
+                    depthComplete = false;
                     break;
                 }
 
                 // 2. Copy current_state in turn_state (node.state is turn_state).
                 // 3. Generate rail choices.
+                //
+                // buildRailChoices + the two disrupt scans + the foe's rail
+                // plan all run before the first choice is expanded, so a node
+                // entered near the deadline overshoots it by that setup cost
+                // alone. Checked again after the setup, below.
                 vector<RailChoice> railChoices =
                     buildRailChoices(node.state, wishes, node.active);
-                beamStats.actionsPerDepth[depth] += (int)railChoices.size();
+                beamStats.actionsCreated[depth] += (int)railChoices.size();
 
                 // 4. Generate both players' best disrupt choices.
                 int myDisrupt = buildDisruptChoice(node.state, wishes, myId, foeId);
@@ -1322,6 +1468,15 @@ public:
                         if (rc.distance < foeBest->distance)
                             foeBest = &rc;
                     foeRails = planRailPlacements(node.state, *foeBest);
+                }
+
+                // The per-node setup above is itself a sizeable chunk of a
+                // depth: bail out here rather than starting to expand.
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    beamStats.truncatedByTime++;
+                    depthComplete = false;
+                    break;
                 }
 
                 if (railChoices.empty())
@@ -1342,6 +1497,16 @@ public:
                 }
 
                 // 7. Iterate over rail choices.
+                if (MAX_BRANCHING > 0 && (int)railChoices.size() > MAX_BRANCHING)
+                {
+                    partial_sort(railChoices.begin(),
+                                 railChoices.begin() + MAX_BRANCHING,
+                                 railChoices.end(),
+                                 [](const RailChoice &a, const RailChoice &b)
+                                 { return a.distance < b.distance; });
+                    railChoices.resize(MAX_BRANCHING);
+                }
+
                 for (const RailChoice &choice : railChoices)
                 {
                     // Expanding a choice is the expensive step, so the budget
@@ -1349,12 +1514,16 @@ public:
                     if (std::chrono::steady_clock::now() >= deadline)
                     {
                         beamStats.truncatedByTime++;
+                        depthComplete = false;
                         break;
                     }
 
                     BeamNode child;
-                    child.state = node.state; // copy turn_state
-                    child.active = node.active;
+                    {
+                        PROFILE(stateCopy);
+                        child.state = node.state; // copy turn_state
+                        child.active = node.active;
+                    }
 
                     if (depth == 0)
                     {
@@ -1376,6 +1545,9 @@ public:
 
                     nextBeam.push_back(move(child));
                 }
+
+                if (!depthComplete)
+                    break;
             }
 
             // Every child built at this depth counts as a state encountered,
@@ -1390,6 +1562,19 @@ public:
             beamStats.maxDepth = depth + 1;
 
             // 8. Keep the Bwidth best states.
+            //
+            // A partial depth only expanded some of the parents, so its
+            // children are not a complete replacement for the previous beam:
+            // dropping the unexpanded parents would throw away lines that
+            // might still be the best available. The two sets are merged
+            // instead and ranked together, which is sound because evaluate()
+            // scores a board absolutely rather than relative to its depth.
+            if (!depthComplete)
+            {
+                for (BeamNode &node : beam)
+                    nextBeam.push_back(move(node));
+            }
+
             sort(nextBeam.begin(), nextBeam.end(),
                  [](const BeamNode &a, const BeamNode &b)
                  { return a.score > b.score; });
@@ -1397,6 +1582,11 @@ public:
                 nextBeam.resize(BEAM_WIDTH);
 
             beam = move(nextBeam);
+
+            // The depth ran out of time: its results are already merged in,
+            // and there is nothing left in the budget for another one.
+            if (!depthComplete)
+                break;
         }
 
         if (!beam.empty())
@@ -1410,9 +1600,6 @@ public:
 
     void gameTurn()
     {
-        // Timed from after the input read, so blocking on stdin does not
-        // count against the search budget.
-        turnStart = std::chrono::steady_clock::now();
         pathTable.resetStats();
 
         bool hasRail = false;
@@ -1457,11 +1644,11 @@ public:
                     cout << ";";
                 cout << actions[i];
             }
-            cout << "\n";
+            cout << endl;
         }
         else
         {
-            cout << "WAIT\n";
+            cout << "WAIT" << endl;
         }
 
         firstTurn = false;
@@ -1470,10 +1657,7 @@ public:
 
 void mainLoopturn(Game &game)
 {
-    if (!game.firstTurn)
-    {
-        PROFILE(mainLoopturn);
-    }
+    PROFILE(mainLoopturn);
 
     game.parse();
     game.gameTurn();
@@ -1494,10 +1678,15 @@ int main()
                 game.pathTable.fieldHits, game.pathTable.fieldMisses,
                 game.pathTable.invalidations, (int)game.pathTable.fieldCount());
 
-        // PRINT_PROFILE(mainLoopturn);
+        PRINT_PROFILE(mainLoopturn);
         PRINT_PROFILE(beamSearch);
-        // PRINT_PROFILE(railChoices);
-        // PRINT_PROFILE(disruptChoice);
-        // PRINT_PROFILE(simulateTurn);
+        PRINT_PROFILE(railChoices);
+        PRINT_PROFILE(disruptChoice);
+        PRINT_PROFILE(simulateTurn);
+        PRINT_PROFILE(evaluate);
+        PRINT_PROFILE(planRails);
+        PRINT_PROFILE(connectionPath);
+        PRINT_PROFILE(railGroupOf);
+        PRINT_PROFILE(stateCopy);
     }
 }

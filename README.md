@@ -75,6 +75,28 @@ Then add rails onto map. Be careful, both player must add they rails at the same
 Bwidth = 20
 maxDepth=10
 
+### Heuristic
+
+Dans un beam search, l'heuristic permet de comparer des état ayant le même état parent. Ces état viennent d'avoir leur score update siute au tour.
+Donc un état qui créer de meilleur connection pour moi ou casse des connectino pour l'adversaire va impacter en conséquence les points.
+Ce qui veut dire qu'on a pas besoin dans l'heuristic de récompenser/malus ses rails et les rails de l'adveraire sur les chemins les plus court existants.
+
+Il faut juste diriger l'algo vers la création de ces chemins.
+
+Chaque rails doit constamment savoir à quels ville il est lié avec une liste de ville avec lesquels il est lié
+
+### Idées
+
+#### GA pour construire un graph pondéré
+
+Trouver la longeur des chemins de rails les plus court entre chaque ville (matrice de taille NbVille * NbVille)
+Créer un graph pondéré avec comme configuration par défault les liaisons de ville demandé.
+Faie un GA qui va couper et créer des liaisons pondéré pour minimiser la distance totale de TOUTE les liaisons du graph.
+Les graph qui ne posède pas les liaisons de ville demandé doivent être extremement déavantagé.
+
+FONTIONNE PAS :
+- Les chemins doivent pouvoir être lié n'importe où, pas que sur des villes
+- Construire un graph blobale ne rapporte pas beaucoup de points par rapport à faire pleins de liaisons rapidemment. Trop lent
 
 ## Game engine
 
