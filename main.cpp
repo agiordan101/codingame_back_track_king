@@ -979,6 +979,46 @@ public:
         gameMap.readTurnState(cin, activeConnections);
     }
 
+    // ---- rail group linking ----
+
+    // Cheapest (Manhattan) pair of cells across the two rail groups attached
+    // to towns `a` and `b`. Returns a RailChoice with distance INT_MAX when
+    // either town is missing or has no group, and distance 0 when the two
+    // groups share a cell, i.e. the towns are already linked.
+    static RailChoice closestGroupLink(const Map &board, int a, int b)
+    {
+        RailChoice best;
+        if (!board.hasTown(a) || !board.hasTown(b))
+            return best;
+
+        vector<Coord> groupA = board.railGroupOf(board.townCoordOf(a));
+        vector<Coord> groupB = board.railGroupOf(board.townCoordOf(b));
+        if (groupA.empty() || groupB.empty())
+            return best;
+
+        // Same group: distance is 0 and no pair of distinct cells needs to be
+        // scanned. Detected on a cell set rather than trusting the cross
+        // product, so a shared cell is caught even when it is not the minimum.
+        set<pair<int, int>> cellsA;
+        for (const Coord &ca : groupA)
+            cellsA.insert({ca.x, ca.y});
+        for (const Coord &cb : groupB)
+            if (cellsA.count({cb.x, cb.y}))
+                return RailChoice(cb, cb, 0);
+
+        // Cross-product of both groups: keep the shortest link.
+        for (const Coord &ca : groupA)
+        {
+            for (const Coord &cb : groupB)
+            {
+                int d = abs(ca.x - cb.x) + abs(ca.y - cb.y);
+                if (d < best.distance)
+                    best = RailChoice(ca, cb, d);
+            }
+        }
+        return best;
+    }
+
     // ---- "Rail placement choice"s creation ----
 
     // For every desired connection not yet built, grow the rail group already
@@ -995,31 +1035,11 @@ public:
         for (const auto &wish : wishes)
         {
             int a = wish.first, b = wish.second;
-            if (!board.hasTown(a) || !board.hasTown(b))
-                continue;
             // Already built: nothing to place for this wish.
             if (active.count({a, b}) || active.count({b, a}))
                 continue;
 
-            Coord ac = board.townCoordOf(a);
-            Coord bc = board.townCoordOf(b);
-
-            vector<Coord> groupA = board.railGroupOf(ac);
-            vector<Coord> groupB = board.railGroupOf(bc);
-            if (groupA.empty() || groupB.empty())
-                continue;
-
-            // Cross-product of both groups: keep the shortest link.
-            RailChoice best;
-            for (const Coord &ca : groupA)
-            {
-                for (const Coord &cb : groupB)
-                {
-                    int d = abs(ca.x - cb.x) + abs(ca.y - cb.y);
-                    if (d < best.distance)
-                        best = RailChoice(ca, cb, d);
-                }
-            }
+            RailChoice best = closestGroupLink(board, a, b);
 
             // distance 0 means the groups already touch: the connection is
             // effectively built, nothing to place.
@@ -1239,14 +1259,21 @@ public:
 
     // ---- heuristic ----
 
-    // Connection points are awarded per turn: each active connection pays a
-    // player 1 point per rail they own along its path. The heuristic is our
-    // income minus the opponent's.
-    static int evaluate(Map &board, const vector<pair<int, int>> &wishes,
-                        int selfId, int otherId)
+    // Weight of one cell of remaining gap on an unbuilt wish. A gap cell is
+    // worth rather less than a point of per-turn income: closing a gap only
+    // pays off once the connection completes, while income is banked now.
+    static const int GAP_PENALTY = 1;
+
+    // Points the two players earn *this turn*: each active connection pays a
+    // player 1 point per rail they own along its path. Called once per
+    // simulated turn and accumulated into the node, mirroring how the referee
+    // awards points, so a state's banked income is a real running total
+    // rather than a snapshot recomputed from the final board.
+    static void turnIncome(Map &board, const vector<pair<int, int>> &wishes,
+                           int selfId, int otherId, int &outSelf, int &outOther)
     {
-        PROFILE(evaluate);
-        int selfPoints = 0, otherPoints = 0;
+        outSelf = 0;
+        outOther = 0;
 
         for (const auto &wish : wishes)
         {
@@ -1261,39 +1288,54 @@ public:
             {
                 int owner = board.tileOwner(c.x, c.y);
                 if (owner == selfId)
-                    selfPoints++;
+                    outSelf++;
                 else if (owner == otherId)
-                    otherPoints++;
+                    outOther++;
             }
         }
-
-        return selfPoints - otherPoints;
     }
 
-    // ---- game engine turn application ----
-
-    // Applies both players' rail creations simultaneously, then the disrupts,
-    // then inking, producing state D+1 in place.
-    static void simulateTurn(Map &board,
-                             const vector<Coord> &myRails, const vector<Coord> &foeRails,
-                             int myDisrupt, int foeDisrupt,
-                             int selfId, int otherId)
+    // How far every still-unconnected wish is from paying out, as the summed
+    // distance between the two rail groups already attached to its towns.
+    // This is the only forward-looking term: the income above cannot see a
+    // connection that does not exist yet, so without this the search has no
+    // gradient to follow towards building one.
+    static int openGapTotal(const Map &board, const vector<pair<int, int>> &wishes)
     {
-        PROFILE(simulateTurn);
+        int gap = 0;
 
-        // Both players place at the same time: a shared tile becomes neutral.
-        for (const Coord &c : myRails)
-            if (board.canPlaceRail(c.x, c.y))
-                board.placeRail(c.x, c.y, selfId);
-        for (const Coord &c : foeRails)
-            if (board.canPlaceRail(c.x, c.y) || board.tileOwner(c.x, c.y) == selfId)
-                board.placeRail(c.x, c.y, otherId);
+        for (const auto &wish : wishes)
+        {
+            int a = wish.first, b = wish.second;
+            RailChoice link = closestGroupLink(board, a, b);
+            // INT_MAX: a town has no rail group at all, nothing to measure.
+            // 0: the groups already touch, so this wish is not open.
+            if (link.distance != INT_MAX)
+                gap += link.distance;
+        }
+        return gap;
+    }
 
-        // Disrupts raise instability and may ink (erasing the region's rails).
-        if (myDisrupt != -1)
-            board.disruptRegion(myDisrupt);
-        if (foeDisrupt != -1)
-            board.disruptRegion(foeDisrupt);
+    // The heuristic proper. `bankedSelf`/`bankedOther` are the points the two
+    // players have actually accumulated over the `turns` simulated so far, so
+    // the rails each player owns on existing shortest paths are already paid
+    // for and must not be counted again here — all that is left is to steer
+    // the search towards creating the connections that do not exist yet.
+    //
+    // The banked total is averaged over the turns that produced it. The beam
+    // ranks states from different depths against each other when a depth is
+    // cut short by the clock, and a raw cumulative total would make a deeper
+    // state win on depth alone; a per-turn rate stays comparable.
+    static int evaluate(const Map &board, const vector<pair<int, int>> &wishes,
+                        int bankedSelf, int bankedOther, int turns)
+    {
+        PROFILE(evaluate);
+
+        int income = bankedSelf - bankedOther;
+        if (turns > 1)
+            income /= turns;
+
+        return income - GAP_PENALTY * openGapTotal(board, wishes);
     }
 
     // ---- beam search ----
@@ -1380,14 +1422,67 @@ public:
         Map state;
         map<pair<int, int>, bool> active;
         int score;
+        // Points banked along this line: every simulated turn adds what each
+        // player earned from the connections active at that moment, the way
+        // the referee pays them out. `turns` is how many turns produced them,
+        // used to keep lines of different depths comparable.
+        int bankedSelf, bankedOther;
+        int turns;
         // The rail choice played at the root of this line, i.e. the move we
         // would actually output this turn.
         bool hasRootChoice;
         RailChoice rootChoice;
         int rootDisrupt;
 
-        BeamNode() : score(0), hasRootChoice(false), rootDisrupt(-1) {}
+        BeamNode()
+            : score(0), bankedSelf(0), bankedOther(0), turns(0),
+              hasRootChoice(false), rootDisrupt(-1) {}
     };
+
+    // ---- game engine turn application ----
+
+    // Plays one full turn on `child`, which starts as a copy of `parent`:
+    // both players' rail creations simultaneously, then the disrupts, then
+    // inking, and finally the payout. Producing state D+1 and banking what it
+    // pays are one operation on purpose — a caller that advanced the board
+    // without crediting the turn would silently lose that turn's income.
+    void simulateTurn(BeamNode &child, const BeamNode &parent,
+                      const vector<pair<int, int>> &wishes,
+                      const vector<Coord> &myRails, const vector<Coord> &foeRails,
+                      int myDisrupt, int foeDisrupt,
+                      int selfId, int otherId)
+    {
+        PROFILE(simulateTurn);
+
+        Map &board = child.state;
+
+        // Both players place at the same time: a shared tile becomes neutral.
+        for (const Coord &c : myRails)
+            if (board.canPlaceRail(c.x, c.y))
+                board.placeRail(c.x, c.y, selfId);
+        for (const Coord &c : foeRails)
+            if (board.canPlaceRail(c.x, c.y) || board.tileOwner(c.x, c.y) == selfId)
+                board.placeRail(c.x, c.y, otherId);
+
+        // Disrupts raise instability and may ink (erasing the region's rails).
+        if (myDisrupt != -1)
+            board.disruptRegion(myDisrupt);
+        if (foeDisrupt != -1)
+            board.disruptRegion(foeDisrupt);
+
+        // The turn is over: settle it. Inherit the line's banked points,
+        // credit what this now-final board pays both players, and rescore.
+        // This runs last because inking above can erase rails, and a rail
+        // erased this turn must not be paid for it.
+        int gainSelf = 0, gainOther = 0;
+        turnIncome(board, wishes, selfId, otherId, gainSelf, gainOther);
+
+        child.bankedSelf = parent.bankedSelf + gainSelf;
+        child.bankedOther = parent.bankedOther + gainOther;
+        child.turns = parent.turns + 1;
+        child.score = evaluate(board, wishes,
+                               child.bankedSelf, child.bankedOther, child.turns);
+    }
 
     // Runs the beam and returns the move to play this turn.
     void beamSearch(bool &outHasRail, RailChoice &outRail, int &outDisrupt)
@@ -1401,7 +1496,9 @@ public:
         BeamNode root;
         root.state = gameMap;
         root.active = activeConnections;
-        root.score = evaluate(root.state, wishes, myId, foeId);
+        // Nothing simulated yet, so nothing banked: the root is judged on its
+        // open gaps alone.
+        root.score = evaluate(root.state, wishes, 0, 0, 0);
 
         vector<BeamNode> beam{root};
 
@@ -1420,9 +1517,10 @@ public:
 
         // A depth no longer has to fit entirely in the remaining time: it is
         // always entered, and abandoned mid-way when the deadline hits. The
-        // states it did produce are still usable, because evaluate() scores a
-        // board in absolute terms at any depth, so a partial depth's children
-        // can be compared directly against the previous depth's survivors.
+        // states it did produce are still usable, because evaluate() averages
+        // banked income over the turns that produced it, so a partial depth's
+        // children can be compared directly against the previous depth's
+        // survivors without the deeper ones winning on depth alone.
         // Whether a depth completed decides how its states are used below.
         bool depthComplete = true;
 
@@ -1490,8 +1588,8 @@ public:
                     child.rootChoice = node.rootChoice;
                     child.rootDisrupt = (depth == 0) ? myDisrupt : node.rootDisrupt;
 
-                    simulateTurn(child.state, {}, foeRails, myDisrupt, foeDisrupt, myId, foeId);
-                    child.score = evaluate(child.state, wishes, myId, foeId);
+                    simulateTurn(child, node, wishes, {}, foeRails,
+                                 myDisrupt, foeDisrupt, myId, foeId);
                     nextBeam.push_back(move(child));
                     continue;
                 }
@@ -1539,9 +1637,8 @@ public:
                     }
 
                     vector<Coord> myRails = planRailPlacements(child.state, choice);
-                    simulateTurn(child.state, myRails, foeRails, myDisrupt, foeDisrupt,
-                                 myId, foeId);
-                    child.score = evaluate(child.state, wishes, myId, foeId);
+                    simulateTurn(child, node, wishes, myRails, foeRails,
+                                 myDisrupt, foeDisrupt, myId, foeId);
 
                     nextBeam.push_back(move(child));
                 }
@@ -1568,7 +1665,7 @@ public:
             // dropping the unexpanded parents would throw away lines that
             // might still be the best available. The two sets are merged
             // instead and ranked together, which is sound because evaluate()
-            // scores a board absolutely rather than relative to its depth.
+            // returns a per-turn rate rather than a depth-dependent total.
             if (!depthComplete)
             {
                 for (BeamNode &node : beam)

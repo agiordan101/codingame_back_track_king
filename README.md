@@ -82,8 +82,9 @@ Donc un état qui créer de meilleur connection pour moi ou casse des connectino
 Ce qui veut dire qu'on a pas besoin dans l'heuristic de récompenser/malus ses rails et les rails de l'adveraire sur les chemins les plus court existants.
 
 Il faut juste diriger l'algo vers la création de ces chemins.
+Pour ça on veut juste savoir les gap de distance entre les groupes de rails lié à 2 towns qui veulent être lié.
 
-Chaque rails doit constamment savoir à quels ville il est lié avec une liste de ville avec lesquels il est lié
+Si l'heuristic reste très basique alors on peut faire plus de simulation, et donc s'orienter vers des cas où les points augmente.
 
 ### Idées
 
