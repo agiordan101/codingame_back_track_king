@@ -69,18 +69,17 @@ public:
 #define PRINT_PROFILE(name)                                                                                                                                                                             \
     do                                                                                                                                                                                                  \
     {                                                                                                                                                                                                   \
-        if (callcount_##name != 0)                                                                                                                                                                      \
-            fprintf(stderr, "%-32s avg time : %f ms  \ttotals : %d ms  \t%d calls\n", #name, (double)elapsed_##name / callcount_##name / 1000, (int)((double)elapsed_##name / 1000), callcount_##name); \
+        fprintf(stderr, "%-32s avg time : %f ms  \ttotals : %d ms  \t%d calls\n", #name, (double)elapsed_##name / callcount_##name / 1000, (int)((double)elapsed_##name / 1000), callcount_##name); \
     } while (0)
 
 // Profile declarations
 DECLARE_PROFILE(beamSearch)
 DECLARE_PROFILE(placementCandidates)
 DECLARE_PROFILE(generateActionSets)
-DECLARE_PROFILE(disruptChoice)
+DECLARE_PROFILE(connectionPathProfile)
+DECLARE_PROFILE(buildDisruptChoice)
 DECLARE_PROFILE(simulateTurn)
 DECLARE_PROFILE(evaluate)
-DECLARE_PROFILE(connectionPath)
 DECLARE_PROFILE(railGroupOf)
 DECLARE_PROFILE(stateCopy)
 DECLARE_PROFILE(openGapTotal)
@@ -876,7 +875,7 @@ public:
     // turn and the per-call vector<vector<>> pair used to dominate the turn.
     void connectionPathInto(Coord from, Coord to, vector<Coord> &path) const
     {
-        PROFILE(connectionPath);
+        PROFILE(connectionPathProfile);
         path.clear();
         if (!inBounds(from.x, from.y) || !inBounds(to.x, to.y))
             return;
@@ -1359,12 +1358,6 @@ public:
 
         while (!lines.empty())
         {
-            if (outOfTime())
-            {
-                aborted = true;
-                break;
-            }
-
             vector<PlacementLine> grown;
 
             for (PlacementLine &line : lines)
@@ -1394,11 +1387,6 @@ public:
                 {
                     // A candidate is a board copy plus a rescore: the grain
                     // that bounds the overrun.
-                    if (outOfTime())
-                    {
-                        aborted = true;
-                        break;
-                    }
 
                     PlacementLine child;
                     {
@@ -1471,16 +1459,13 @@ public:
                            const vector<pair<int, int>> &wishes,
                            int selfId, int otherId) const
     {
-        PROFILE(disruptChoice);
+        PROFILE(buildDisruptChoice);
 
         // Collect the cells of every currently active connection once.
         // Interruptible: a partial set just means fewer candidate regions.
         vector<vector<Coord>> connectionPaths;
         for (const auto &wish : wishes)
         {
-            if (outOfTime())
-                break;
-
             int a = wish.first, b = wish.second;
             if (!board.hasTown(a) || !board.hasTown(b))
                 continue;
@@ -1559,9 +1544,6 @@ public:
 
         for (const auto &wish : wishes)
         {
-            if (outOfTime())
-                break;
-
             int a = wish.first, b = wish.second;
             if (!board.hasTown(a) || !board.hasTown(b))
                 continue;
@@ -1737,8 +1719,6 @@ public:
         int gap = 0;
         for (const auto &wish : wishes)
         {
-            if (outOfTime())
-                break;
             const int d = wishGap(board, wish, components);
             if (d >= 0)
                 gap += d;
@@ -1770,36 +1750,35 @@ public:
 
     // ---- game engine turn application ----
 
-    // Plays one full turn on `child`, which starts as a copy of `parent`:
-    // both players' rails land simultaneously, then both pick and apply a
-    // disrupt, then the payout. Producing state D+1 and banking what it pays
-    // are one operation on purpose — a caller that advanced the board without
-    // crediting the turn would silently lose that turn's income.
-    //
-    // Returns the region `selfId` disrupted, or -1. The caller needs it at the
-    // root, where it is half of the move actually played.
-    int simulateTurn(BeamNode &child, const BeamNode &parent,
-                     const vector<pair<int, int>> &wishes,
-                     const vector<Coord> &myRails, const vector<Coord> &foeRails,
-                     int selfId, int otherId)
+    // Both players' rails land at the same time: a shared tile becomes
+    // neutral. Disrupts are picked on the board this produces, so it is a step
+    // of its own.
+    static void placeTurnRails(Map &board,
+                               const vector<Coord> &myRails,
+                               const vector<Coord> &foeRails,
+                               int selfId, int otherId)
     {
-        PROFILE(simulateTurn);
-
-        Map &board = child.state;
-
-        // Both players place at the same time: a shared tile becomes neutral.
         for (const Coord &c : myRails)
             if (board.canPlaceRail(c.x, c.y))
                 board.placeRail(c.x, c.y, selfId);
         for (const Coord &c : foeRails)
             if (board.canPlaceRail(c.x, c.y) || board.tileOwner(c.x, c.y) == selfId)
                 board.placeRail(c.x, c.y, otherId);
+    }
 
-        // The turn's rails are down, so the disrupts are picked on the board
-        // they produced: a region only becomes worth hitting once the rails
-        // that make it valuable are actually on it.
-        int myDisrupt = buildDisruptChoice(board, wishes, selfId, otherId);
-        int foeDisrupt = buildDisruptChoice(board, wishes, otherId, selfId);
+    // Applies both disrupts to a board whose rails are already down, then
+    // settles the turn: credit what it pays both players and rescore.
+    // Advancing the board and banking its income are one operation on purpose
+    // — a caller that did the first without the second would silently lose
+    // that turn's points.
+    void simulateTurn(BeamNode &child, const BeamNode &parent,
+                      const vector<pair<int, int>> &wishes,
+                      int myDisrupt, int foeDisrupt,
+                      int selfId, int otherId)
+    {
+        PROFILE(simulateTurn);
+
+        Map &board = child.state;
 
         // Disrupts raise instability and may ink (erasing the region's rails).
         if (myDisrupt != -1)
@@ -1807,10 +1786,8 @@ public:
         if (foeDisrupt != -1)
             board.disruptRegion(foeDisrupt);
 
-        // The turn is over: settle it. Inherit the line's banked points,
-        // credit what this now-final board pays both players, and rescore.
-        // This runs last because inking above can erase rails, and a rail
-        // erased this turn must not be paid for it.
+        // Last, because inking above can erase rails and a rail erased this
+        // turn must not be paid for it.
         int gainSelf = 0, gainOther = 0;
         turnIncome(board, wishes, selfId, otherId, gainSelf, gainOther);
 
@@ -1819,8 +1796,6 @@ public:
         child.turns = parent.turns + 1;
         child.score = evaluate(board, wishes,
                                child.bankedSelf, child.bankedOther, child.turns);
-
-        return myDisrupt;
     }
 
     // Runs the beam and returns the move to play this turn.
@@ -1859,7 +1834,6 @@ public:
 
         vector<BeamNode> beam{root};
 
-
         // A depth no longer has to fit entirely in the remaining time: it is
         // always entered, and abandoned mid-way when the deadline hits. The
         // states it did produce are still usable, because evaluate() averages
@@ -1871,9 +1845,6 @@ public:
 
         for (int depth = 0; depth < MAX_DEPTH; depth++)
         {
-            if (outOfTime())
-                break;
-
             vector<BeamNode> nextBeam;
             depthComplete = true;
 
@@ -1912,16 +1883,6 @@ public:
                 stats.actionsCreated[depth] += (int)myTurns.size();
                 stats.placementStates[depth] += placementStates;
 
-                // The planning above stops on the deadline by itself, but it
-                // can stop having produced next to nothing: bail out here
-                // rather than expanding a turn it never got to think about.
-                if (outOfTime())
-                {
-                    stats.truncatedByTime++;
-                    depthComplete = false;
-                    break;
-                }
-
                 // Nothing left to build: still play the turn, so the line
                 // keeps evolving through the opponent's rails and the
                 // disrupts.
@@ -1946,12 +1907,21 @@ public:
                         child.active = node.active;
                     }
 
-                    // The plan already names its cells, in the order they were
-                    // decided: no replanning, so the board the search scored
-                    // is the one that gets played.
-                    int myDisrupt = simulateTurn(child, node, wishes,
-                                                 action.cells, foeRails,
-                                                 myId, foeId);
+                    // The plan already names its cells: no replanning, so the
+                    // board the search scored is the one that gets played.
+                    placeTurnRails(child.state, action.cells, foeRails,
+                                   myId, foeId);
+
+                    // Picked on the board the rails just produced: a region is
+                    // only worth hitting once the rails that make it valuable
+                    // are on it.
+                    int myDisrupt =
+                        buildDisruptChoice(child.state, wishes, myId, foeId);
+                    int foeDisrupt =
+                        buildDisruptChoice(child.state, wishes, foeId, myId);
+
+                    simulateTurn(child, node, wishes, myDisrupt, foeDisrupt,
+                                 myId, foeId);
 
                     if (depth == 0)
                     {
@@ -2145,10 +2115,10 @@ int main()
         PRINT_PROFILE(beamSearch);
         PRINT_PROFILE(placementCandidates);
         PRINT_PROFILE(generateActionSets);
-        PRINT_PROFILE(disruptChoice);
+        PRINT_PROFILE(buildDisruptChoice);
         PRINT_PROFILE(simulateTurn);
         PRINT_PROFILE(evaluate);
-        PRINT_PROFILE(connectionPath);
+        PRINT_PROFILE(connectionPathProfile);
         PRINT_PROFILE(railGroupOf);
         PRINT_PROFILE(stateCopy);
         PRINT_PROFILE(openGapTotal);
