@@ -1,11 +1,18 @@
 // v2.0
-// - Beam search over simulated future states
-// - Rail placement choices: shortest link between the two rail groups
-//     already connected to each town of an unbuilt desired connection
-// - Disrupt choice: best region where the opponent owns more connection
-//     rails than we do
-// - Greedy 3-paint-point rail application, A*-guided, NORTH/EAST/SOUTH/WEST
-//     tie-breaking
+
+// Nested beam searches: an outer one plans turns ahead, and for each of its
+// nodes an inner one decides that turn's rails one cell at a time. Both are
+// interruptible, playing the best line found when the turn budget runs out.
+
+// - Rail placement: every affordable cell touching the network, scored by how
+//     much it shortens the remaining wishes.
+// - Turn scoring (extendGap): per wish, the terrain distance from a newly
+//     laid cell to whichever of its two towns is farther.
+// - State scoring (evaluate): income difference per turn, minus GAP_PENALTY
+//     per cell of true remaining gap, from one multi-source flood fill
+//     (openGapTotal) that reads off where two components' floods meet.
+// - Disrupt choice: the region where the opponent owns the most connection
+//     rails more than we do. Four disrupts ink a region and erase its rails.
 
 #undef _GLIBCXX_DEBUG
 #pragma GCC optimize("Ofast,unroll-loops,omit-frame-pointer,inline")
@@ -104,13 +111,13 @@ DECLARE_PROFILE(sortBeam)
 // ====================
 // CONSTANTS
 
-static const int BEAM_WIDTH = 10;
+static const int BEAM_WIDTH = 15;
 // Width of the intra-turn beam, i.e. how many half-built turns stay alive
 // between one rail and the next. It is a separate knob from BEAM_WIDTH
 // because the two buy different things and cost very differently: widening
 // here multiplies the work spent on a single turn, which comes straight out
 // of the depth the outer beam can reach.
-static const int NESTED_BEAM_WIDTH = 10;
+static const int NESTED_BEAM_WIDTH = 20;
 
 // Upper bound on how many turn plans one state expands into, i.e. how many
 // of the intra-turn beam's survivors the outer beam actually simulates. It
@@ -126,8 +133,8 @@ static const int PAINT_PER_TURN = 3;
 // (1000 ms on the first). The deadline is only tested between expansions, so
 // the budget stays well under the limit to absorb one in-flight expansion
 // plus the final replay and output.
-static const int TURN_BUDGET_MS = 30;
-static const int FIRST_TURN_BUDGET_MS = 30;
+static const int TURN_BUDGET_MS = 45;
+static const int FIRST_TURN_BUDGET_MS = 900;
 
 // Owner marker for a tile carrying no rail.
 static const int NO_OWNER = -1;
@@ -890,7 +897,7 @@ public:
         for (auto &kv : regionById)
             ids.push_back(kv.first);
         {
-            PROFILE(sortRegionIds);
+            // PROFILE(sortRegionIds);
             sort(ids.begin(), ids.end());
         }
         return ids;
@@ -930,7 +937,7 @@ public:
     // towns. This is the "rail group connected to the town" of the spec.
     vector<Coord> railGroupOf(Coord townCell) const
     {
-        PROFILE(railGroupOf);
+        // PROFILE(railGroupOf);
         vector<Coord> group;
         if (!inBounds(townCell.x, townCell.y))
             return group;
@@ -986,7 +993,7 @@ public:
     // turn and the per-call vector<vector<>> pair used to dominate the turn.
     void connectionPathInto(Coord from, Coord to, vector<Coord> &path) const
     {
-        PROFILE(connectionPathProfile);
+        // PROFILE(connectionPathProfile);
         path.clear();
         if (!inBounds(from.x, from.y) || !inBounds(to.x, to.y))
             return;
@@ -1439,7 +1446,7 @@ public:
     static void placementCandidates(const Map &board, int paintLeft,
                                     vector<Coord> &cells)
     {
-        PROFILE(placementCandidates);
+        // PROFILE(placementCandidates);
 
         cells.clear();
         if (paintLeft <= 0)
@@ -1481,7 +1488,7 @@ public:
                                          const vector<pair<int, int>> &wishes,
                                          int owner, int keep, int &statesSeen)
     {
-        PROFILE(generateActionSets);
+        // PROFILE(generateActionSets);
 
         vector<ActionSet> finished;
         bool aborted = false;
@@ -1494,7 +1501,7 @@ public:
         // line sees the same starting position without anyone copying a grid.
         Map &board = scratchBoard;
         {
-            PROFILE(stateCopy);
+            // PROFILE(stateCopy);
             board = startBoard;
         }
 
@@ -1554,7 +1561,7 @@ public:
 
                 for (const Coord &c : candidates)
                 {
-                    PROFILE(candidateCreation);
+                    // PROFILE(candidateCreation);
 
                     PlacementLine child;
                     child.action = line.action;
@@ -1598,7 +1605,7 @@ public:
             // Ordering an index permutation rather than the lines themselves,
             // so a swap moves an int instead of a line's vectors.
             {
-                PROFILE(sortRoundLines);
+                // PROFILE(sortRoundLines);
                 const int survivors = min<int>(keep, (int)grown.size());
 
                 grownOrder.resize(grown.size());
@@ -1620,7 +1627,7 @@ public:
 
         // Lines finish at different rounds, so rank the survivors together.
         {
-            PROFILE(sortFinishedLines);
+            // PROFILE(sortFinishedLines);
             sort(finished.begin(), finished.end(), betterPlacement);
         }
         if ((int)finished.size() > keep)
@@ -1642,7 +1649,7 @@ public:
                            const vector<pair<int, int>> &wishes,
                            int selfId, int otherId) const
     {
-        PROFILE(buildDisruptChoice);
+        // PROFILE(buildDisruptChoice);
 
         // Collect the cells of every currently active connection once.
         // Interruptible: a partial set just means fewer candidate regions.
@@ -1940,7 +1947,7 @@ public:
 
     int openGapTotal(const Map &board, const vector<pair<int, int>> &wishes) const
     {
-        PROFILE(openGapTotal);
+        // PROFILE(openGapTotal);
 
         const int components = labelComponents(board);
         if (components == 0)
@@ -1970,7 +1977,7 @@ public:
     int evaluate(const Map &board, const vector<pair<int, int>> &wishes,
                  int bankedSelf, int bankedOther, int turns) const
     {
-        PROFILE(evaluate);
+        // PROFILE(evaluate);
 
         int income = bankedSelf - bankedOther;
         if (turns > 1)
@@ -2007,7 +2014,7 @@ public:
                       int myDisrupt, int foeDisrupt,
                       int selfId, int otherId)
     {
-        PROFILE(simulateTurn);
+        // PROFILE(simulateTurn);
 
         Map &board = child.state;
 
@@ -2032,7 +2039,7 @@ public:
     // Runs the beam and returns the move to play this turn.
     void run(ActionSet &outAction, int &outDisrupt)
     {
-        PROFILE(beamSearch);
+        // PROFILE(beamSearch);
 
         outAction = ActionSet();
         outDisrupt = -1;
@@ -2126,7 +2133,7 @@ public:
 
                     BeamNode child;
                     {
-                        PROFILE(stateCopy);
+                        // PROFILE(stateCopy);
                         child.state = node.state;
                         child.active = node.active;
                     }
@@ -2191,7 +2198,7 @@ public:
             }
 
             {
-                PROFILE(sortBeam);
+                // PROFILE(sortBeam);
                 sort(nextBeam.begin(), nextBeam.end(),
                      [](const BeamNode &a, const BeamNode &b)
                      { return a.score > b.score; });
@@ -2340,20 +2347,20 @@ int main()
                 game.pathTable.deadEncountered, game.pathTable.invalidations,
                 (int)game.pathTable.size());
 
-        PRINT_PROFILE(beamSearch);
-        PRINT_PROFILE(placementCandidates);
-        PRINT_PROFILE(generateActionSets);
-        PRINT_PROFILE(candidateCreation);
-        PRINT_PROFILE(buildDisruptChoice);
-        PRINT_PROFILE(simulateTurn);
-        PRINT_PROFILE(evaluate);
-        PRINT_PROFILE(connectionPathProfile);
-        PRINT_PROFILE(railGroupOf);
-        PRINT_PROFILE(stateCopy);
-        PRINT_PROFILE(openGapTotal);
-        PRINT_PROFILE(sortRegionIds);
-        PRINT_PROFILE(sortRoundLines);
-        PRINT_PROFILE(sortFinishedLines);
-        PRINT_PROFILE(sortBeam);
+        // PRINT_PROFILE(beamSearch);
+        // PRINT_PROFILE(placementCandidates);
+        // PRINT_PROFILE(generateActionSets);
+        // PRINT_PROFILE(candidateCreation);
+        // PRINT_PROFILE(buildDisruptChoice);
+        // PRINT_PROFILE(simulateTurn);
+        // PRINT_PROFILE(evaluate);
+        // PRINT_PROFILE(connectionPathProfile);
+        // PRINT_PROFILE(railGroupOf);
+        // PRINT_PROFILE(stateCopy);
+        // PRINT_PROFILE(openGapTotal);
+        // PRINT_PROFILE(sortRegionIds);
+        // PRINT_PROFILE(sortRoundLines);
+        // PRINT_PROFILE(sortFinishedLines);
+        // PRINT_PROFILE(sortBeam);
     }
 }

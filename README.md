@@ -138,12 +138,19 @@ Each time we want a A* distance, verify if a cache entry exist :
 
 ### v2.0
 
-* Rail placement choices : for each unbuilt desired connection, flood the rail/town group attached to each town, cross-product both groups, keep the shortest Manhattan link.
-* Disrupt choice : regions that are not inked, hold no town, carry opponent rails, and where the opponent's unique connection-rail count exceeds mine; best one only.
-* Rail application : walks source→destination picking the neighbour closest to the target, ties broken NORTH/EAST/SOUTH/WEST, spending exactly the 3 paint points at 1/2/3 per plains/river/mountain.
-* Turn simulation : both players' rails applied simultaneously (shared tile → neutral owner 2), then disrupts, then inking.
-* Beam search : Bwidth 20, maxDepth 10, heuristic = my connection points − opponent's.
+Nested beam searches: an outer one plans turns ahead, and for each of its
+nodes an inner one decides that turn's rails one cell at a time. Both are
+interruptible, playing the best line found when the turn budget runs out.
 
+- Rail placement: every affordable cell touching the network, scored by how
+    much it shortens the remaining wishes.
+- Turn scoring (extendGap): per wish, the terrain distance from a newly
+    laid cell to whichever of its two towns is farther.
+- State scoring (evaluate): income difference per turn, minus GAP_PENALTY
+    per cell of true remaining gap, from one multi-source flood fill
+    (openGapTotal) that reads off where two components' floods meet.
+- Disrupt choice: the region where the opponent owns the most connection
+    rails more than we do. Four disrupts ink a region and erase its rails.
 
 ### v1.2
 
