@@ -34,7 +34,9 @@ using namespace std;
 // PROFILING
 
 // Per-function call counts and accumulated microseconds. Printed each turn
-// from main() alongside snapshotCommittedChild stats.
+// from main() alongside snapshotCommittedChild stats. Counters are cumulative
+// over the game; PROFILE_END_TURN() marks a turn boundary so the print can
+// also report a per-turn average.
 
 class ProfileScope
 {
@@ -60,16 +62,26 @@ public:
     int callcount_##name = 0; \
     int elapsed_##name = 0;
 
+// Number of game turns elapsed, bumped by PROFILE_END_TURN(). The counters
+// above are cumulative over the whole game, so dividing by this gives the
+// per-turn averages, which is what actually matters for a time budget that
+// is spent turn by turn.
+int profileTurnCount = 0;
+#define PROFILE_END_TURN() (profileTurnCount++)
+
 #if ENABLE_PROFILING
 #define PROFILE(name) ProfileScope _ps_##name(callcount_##name, elapsed_##name)
 #else
 #define PROFILE(name) ((void)0)
 #endif
 
-#define PRINT_PROFILE(name)                                                                                                                                                                         \
-    do                                                                                                                                                                                              \
-    {                                                                                                                                                                                               \
-        fprintf(stderr, "%-32s avg time : %f ms  \ttotals : %d ms  \t%d calls\n", #name, (double)elapsed_##name / callcount_##name / 1000, (int)((double)elapsed_##name / 1000), callcount_##name); \
+#define PRINT_PROFILE(name)                                                    \
+    do                                                                         \
+    {                                                                          \
+        int _turns = profileTurnCount > 0 ? profileTurnCount : 1;              \
+        fprintf(stderr, "%-32s per turn : %.3f ms  \t%d calls\n", #name,         \
+                (double)elapsed_##name / _turns / 1000,                        \
+                (int)((double)callcount_##name / _turns));                            \
     } while (0)
 
 // Profile declarations
@@ -277,10 +289,79 @@ static int aStar(Coord src, Coord dst, int width, int height, StepCostFn stepCos
     return INT_MAX; // dst is unreachable
 }
 
+// Same A* as above, but also reports the cells the shortest path runs
+// through. `outPath` receives src..dst inclusive on success and is left empty
+// when dst is unreachable. Separate from the cost-only version because
+// tracking parents costs an extra grid and most callers only want the number.
+template <typename StepCostFn>
+static int aStarPath(Coord src, Coord dst, int width, int height,
+                     StepCostFn stepCost, vector<Coord> &outPath)
+{
+    outPath.clear();
+    if (src == dst)
+    {
+        outPath.push_back(src);
+        return 0;
+    }
+
+    vector<vector<int>> gScore(height, vector<int>(width, INT_MAX));
+    vector<vector<int>> parent(height, vector<int>(width, -1));
+    gScore[src.y][src.x] = 0;
+
+    auto heuristic = [&](int x, int y)
+    {
+        return abs(x - dst.x) + abs(y - dst.y);
+    };
+
+    priority_queue<tuple<int, int, int, int>, vector<tuple<int, int, int, int>>, greater<>> pq;
+    pq.push({heuristic(src.x, src.y), 0, src.x, src.y});
+
+    while (!pq.empty())
+    {
+        auto [f, g, x, y] = pq.top();
+        pq.pop();
+        (void)f;
+
+        if (x == dst.x && y == dst.y)
+        {
+            for (int cur = y * width + x; cur != -1;
+                 cur = parent[cur / width][cur % width])
+                outPath.push_back(Coord(cur % width, cur / width));
+            reverse(outPath.begin(), outPath.end());
+            return g;
+        }
+
+        // Stale entry: a shorter path to (x, y) was already found.
+        if (g > gScore[y][x])
+            continue;
+
+        for (int k = 0; k < 4; k++)
+        {
+            int nx = x + DIR_X[k], ny = y + DIR_Y[k];
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height)
+                continue;
+
+            int step = stepCost(nx, ny);
+            if (step == INT_MAX)
+                continue;
+
+            int ng = g + step;
+            if (ng < gScore[ny][nx])
+            {
+                gScore[ny][nx] = ng;
+                parent[ny][nx] = y * width + x;
+                pq.push({ng + heuristic(nx, ny), ng, nx, ny});
+            }
+        }
+    }
+
+    return INT_MAX; // dst is unreachable
+}
+
 // ====================
 // PATH LOOKUP TABLE
 
-// One cached path between two cells: its A* cost and the set of regions it
+// One cached path between two cells: its distance and the set of regions it
 // crosses. The region list is what makes targeted invalidation possible —
 // when a region is inked, only the paths that ran through it are wrong.
 class PathInfo
@@ -289,54 +370,39 @@ public:
     int distance;
     // Regions the path crosses, sorted and deduplicated.
     vector<int> regions;
-    PathInfo() : distance(INT_MAX) {}
+    // Tombstone: an inked region invalidated this entry. The entry is kept so
+    // invalidation stays a flat walk over one bucket, and the next find() for
+    // the pair recomputes it in place. See PathTable::invalidateRegion.
+    bool dead;
+    PathInfo() : distance(INT_MAX), dead(false) {}
 };
 
 // Cache of cell-to-cell paths, plus the reverse index region -> paths that
-// cross it. Both are filled at the same time, so inking a region can drop
-// exactly the entries that depended on it instead of clearing everything.
+// cross it. Both are filled at the same time, so inking a region drops
+// exactly the entries that depended on it and nothing else.
 //
 // The cached distances describe the terrain (cost and ink), not the rails
 // laid during the search, so a single table stays valid for every beam node.
 class PathTable
 {
-public:
-    // Key for a cell pair. Paths are symmetric, so the two endpoints are
-    // stored in a canonical order and each pair is cached once.
-    typedef pair<int, int> CellPair; // (from index, to index)
-
-    // A whole distance field from one destination cell to every other cell,
-    // over terrain and ink only (rails excluded, so it survives every beam
-    // node). Cached because the rail walk queries it four times per step and
-    // it is otherwise recomputed for every choice at every node.
-    class DistanceField
-    {
-    public:
-        vector<int> dist; // indexed by cellIndex
-        vector<int> regions;
-        // Ink generation this field was built against; stale if older than
-        // the table's current generation.
-        int generation = 0;
-        DistanceField() {}
-    };
-
 private:
     unordered_map<long long, PathInfo> paths;
-    // regionId -> keys of every cached path crossing that region.
+    // regionId -> keys of every cached path crossing that region. A key may
+    // appear more than once only across distinct regions, never twice in the
+    // same bucket, because PathInfo::regions is deduplicated.
     unordered_map<int, vector<long long>> pathsByRegion;
 
-    // Distance fields keyed by destination cell, with the same reverse index
-    // so inking a region drops the fields that crossed it.
-    unordered_map<int, DistanceField> fields;
-    unordered_map<int, vector<int>> fieldsByRegion;
-
-    // Regions known to be inked, and the ink generation. The generation is
-    // bumped whenever a new region is inked, so any entry cached earlier is
-    // recognised as stale even if the reverse index no longer lists it.
+    // Regions known to be inked. A path computed after a region is inked can
+    // never cross it (the region is impassable), so it never registers under
+    // that region and no later entry can be missed. Entries are therefore
+    // dropped purely by reverse index — no global generation counter, so
+    // inking one region leaves every unrelated path cached.
     set<int> inkedRegions;
-    int generation = 0;
 
     int width, height;
+
+    // Reused by find() so a miss does not allocate a fresh path vector.
+    vector<Coord> scratchPath;
 
     long long makeKey(int fromIdx, int toIdx) const
     {
@@ -346,10 +412,40 @@ private:
         return (long long)fromIdx * (long long)(width * height) + toIdx;
     }
 
+    // Stores a computed path and indexes it under every region it crosses.
+    // Private: entries are only ever created by find() on a miss, so a cached
+    // distance can never disagree with what A* would return for the board.
+    //
+    // insert_or_assign overwrites any tombstone for the pair, clearing `dead`
+    // with it. A revived entry re-registers under the regions the new path
+    // crosses; those are necessarily un-inked, so the only bucket it could
+    // land in twice is one it already sits in from the previous computation.
+    // pushing a duplicate would make invalidateRegion visit it twice, which
+    // the `dead` check there already absorbs, but the bucket would still grow
+    // without bound across repeated revivals — so skip keys already present.
+    const PathInfo *insert(Coord a, Coord b, PathInfo info)
+    {
+        long long key = makeKey(cellIndex(a), cellIndex(b));
+        const bool revived = paths.count(key) != 0;
+        for (int r : info.regions)
+        {
+            auto &bucket = pathsByRegion[r];
+            if (revived &&
+                std::find(bucket.begin(), bucket.end(), key) != bucket.end())
+                continue;
+            bucket.push_back(key);
+        }
+        auto res = paths.insert_or_assign(key, move(info));
+        return &res.first->second;
+    }
+
 public:
     // Statistics, printed with the other per-turn beam numbers.
     int hits = 0, misses = 0, invalidations = 0;
-    int fieldHits = 0, fieldMisses = 0;
+    // Misses that landed on a tombstoned entry rather than an absent one, i.e.
+    // recomputes caused by ink. Splits `misses` into cold lookups
+    // (misses - deadEncountered) and re-work forced by invalidation.
+    int deadEncountered = 0;
 
     void init(int w, int h)
     {
@@ -362,113 +458,102 @@ public:
     {
         paths.clear();
         pathsByRegion.clear();
-        fields.clear();
-        fieldsByRegion.clear();
     }
 
     void resetStats()
     {
         hits = misses = invalidations = 0;
-        fieldHits = fieldMisses = 0;
-    }
-
-    // ---- distance fields ----
-
-    const DistanceField *findField(Coord dst)
-    {
-        auto it = fields.find(cellIndex(dst));
-        if (it == fields.end())
-        {
-            fieldMisses++;
-            return nullptr;
-        }
-        // Built before the latest region was inked: recompute it.
-        if (it->second.generation != generation)
-        {
-            fields.erase(it);
-            invalidations++;
-            fieldMisses++;
-            return nullptr;
-        }
-        fieldHits++;
-        return &it->second;
-    }
-
-    // Caches a field and indexes it under every region it reaches.
-    //
-    // Staleness is tracked with a generation counter rather than by refusing
-    // fields that touch inked regions: a field built now already accounts for
-    // the ink known now, and only entries created before the latest ink event
-    // are wrong. invalidateRegion() bumps the generation and drops those.
-    const DistanceField *insertField(Coord dst, DistanceField field)
-    {
-        int key = cellIndex(dst);
-        field.generation = generation;
-        for (int r : field.regions)
-            fieldsByRegion[r].push_back(key);
-        auto res = fields.insert_or_assign(key, move(field));
-        return &res.first->second;
+        deadEncountered = 0;
     }
 
     int cellIndex(Coord c) const { return c.y * width + c.x; }
 
-    // Returns the cached entry for a pair, or nullptr on a miss.
-    const PathInfo *find(Coord a, Coord b)
+    // Distance between two cells over terrain and ink, computed once and
+    // reused. On a miss the path is built with A* against `board` and cached
+    // along with the regions it crosses, so inking one of them drops it.
+    //
+    // `board` is templated only to keep PathTable independent of Map, which is
+    // declared later; it is always the Map the search is running on. The step
+    // cost is terrain cost, with inked cells impassable — deliberately blind
+    // to rails, so one table stays valid across every beam node.
+    //
+    // Returns a pointer into the table, or nullptr when dst is unreachable.
+    // Unreachability is not cached: it depends only on ink, and any ink event
+    // that could change it also invalidates through invalidateRegion().
+    template <typename BoardT>
+    const PathInfo *find(const BoardT &board, Coord a, Coord b)
     {
         auto it = paths.find(makeKey(cellIndex(a), cellIndex(b)));
-        if (it == paths.end())
+        if (it != paths.end())
         {
-            misses++;
-            return nullptr;
+            if (!it->second.dead)
+            {
+                hits++;
+                return &it->second;
+            }
+            // Present but invalidated: counted as a miss like any other, and
+            // separately as re-work that ink forced.
+            deadEncountered++;
         }
-        hits++;
-        return &it->second;
+        misses++;
+
+        scratchPath.clear();
+        const int dist = aStarPath(
+            a, b, width, height,
+            [&](int x, int y)
+            {
+                if (board.tileInked(x, y))
+                    return INT_MAX;
+                return terrainCost(board.tileType(x, y));
+            },
+            scratchPath);
+        if (dist == INT_MAX)
+            return nullptr;
+
+        PathInfo info;
+        info.distance = dist;
+        info.regions.reserve(scratchPath.size());
+        for (const Coord &c : scratchPath)
+            info.regions.push_back(board.tileRegion(c.x, c.y));
+        sort(info.regions.begin(), info.regions.end());
+        info.regions.erase(unique(info.regions.begin(), info.regions.end()),
+                           info.regions.end());
+
+        return insert(a, b, move(info));
     }
 
-    // Stores a computed path and indexes it under every region it crosses.
-    void insert(Coord a, Coord b, PathInfo info)
-    {
-        long long key = makeKey(cellIndex(a), cellIndex(b));
-        for (int r : info.regions)
-            pathsByRegion[r].push_back(key);
-        paths[key] = move(info);
-    }
-
-    // Drops every path and field that crossed the region, so the next lookup
-    // recomputes it against the new (inked) terrain.
+    // Marks every path that crossed the region as stale, so the next lookup
+    // recomputes it against the new (inked) terrain. Paths that avoid the
+    // region are untouched and stay cached.
     //
-    // The region is also remembered as inked: the reverse index is consumed
-    // here, so without that flag a field built later and registered under the
-    // same region would never be dropped again.
+    // Entries are tombstoned rather than erased. Erasing meant unregistering
+    // each dead key from the buckets of every other region it crossed, which
+    // is a linear scan per region per path — on a board where hundreds of
+    // paths cross an inked region that dominates the ink event. A flag makes
+    // this one pass over a single bucket, and leaves the stale keys in the
+    // other buckets harmless: re-inking cannot happen (inkedRegions guards
+    // it), and find() rebuilds a dead entry in place on next use.
     void invalidateRegion(int regionId)
     {
-        // Only a region that was not already inked changes the terrain, and
-        // only then does everything cached earlier become stale.
+        // Only a region that was not already inked changes the terrain.
         if (!inkedRegions.insert(regionId).second)
             return;
-        generation++;
 
         auto it = pathsByRegion.find(regionId);
-        if (it != pathsByRegion.end())
-        {
-            for (long long key : it->second)
-            {
-                if (paths.erase(key))
-                    invalidations++;
-            }
-            pathsByRegion.erase(it);
-        }
+        if (it == pathsByRegion.end())
+            return;
 
-        auto fit = fieldsByRegion.find(regionId);
-        if (fit != fieldsByRegion.end())
+        for (long long key : it->second)
         {
-            for (int key : fit->second)
-            {
-                if (fields.erase(key))
-                    invalidations++;
-            }
-            fieldsByRegion.erase(fit);
+            auto pit = paths.find(key);
+            if (pit == paths.end() || pit->second.dead)
+                continue; // already stale via another inked region
+            pit->second.dead = true;
+            invalidations++;
         }
+        // The bucket has done its job: every path crossing this region is
+        // now dead, and no live path can ever register here again.
+        pathsByRegion.erase(it);
     }
 
     bool isRegionInked(int regionId) const
@@ -476,8 +561,20 @@ public:
         return inkedRegions.count(regionId) != 0;
     }
 
-    size_t size() const { return paths.size(); }
-    size_t fieldCount() const { return fields.size(); }
+    // Live entries only: tombstones still occupy a slot until the pair is
+    // looked up again, and reporting them as cached would overstate the table.
+    size_t size() const
+    {
+        size_t live = 0;
+        for (const auto &kv : paths)
+            if (!kv.second.dead)
+                live++;
+        return live;
+    }
+
+    // Total slots held, tombstones included. Useful to see how much dead
+    // weight the table is carrying between recomputes.
+    size_t slotCount() const { return paths.size(); }
 };
 
 // ====================
@@ -2234,13 +2331,14 @@ int main()
     while (true)
     {
         mainLoopturn(game);
+        PROFILE_END_TURN();
 
         game.beam.stats.print();
-        fprintf(stderr, "%-32s path LT : %d hits / %d misses, fields %d/%d, "
+        fprintf(stderr, "%-32s path LT : %d hits / %d misses (%d dead), "
                         "%d invalidated, %d cached\n",
                 "pathTable", game.pathTable.hits, game.pathTable.misses,
-                game.pathTable.fieldHits, game.pathTable.fieldMisses,
-                game.pathTable.invalidations, (int)game.pathTable.fieldCount());
+                game.pathTable.deadEncountered, game.pathTable.invalidations,
+                (int)game.pathTable.size());
 
         PRINT_PROFILE(beamSearch);
         PRINT_PROFILE(placementCandidates);
