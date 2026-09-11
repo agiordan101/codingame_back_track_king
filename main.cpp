@@ -66,9 +66,9 @@ public:
 #define PROFILE(name) ((void)0)
 #endif
 
-#define PRINT_PROFILE(name)                                                                                                                                                                             \
-    do                                                                                                                                                                                                  \
-    {                                                                                                                                                                                                   \
+#define PRINT_PROFILE(name)                                                                                                                                                                         \
+    do                                                                                                                                                                                              \
+    {                                                                                                                                                                                               \
         fprintf(stderr, "%-32s avg time : %f ms  \ttotals : %d ms  \t%d calls\n", #name, (double)elapsed_##name / callcount_##name / 1000, (int)((double)elapsed_##name / 1000), callcount_##name); \
     } while (0)
 
@@ -76,6 +76,7 @@ public:
 DECLARE_PROFILE(beamSearch)
 DECLARE_PROFILE(placementCandidates)
 DECLARE_PROFILE(generateActionSets)
+DECLARE_PROFILE(candidateCreation)
 DECLARE_PROFILE(connectionPathProfile)
 DECLARE_PROFILE(buildDisruptChoice)
 DECLARE_PROFILE(simulateTurn)
@@ -97,9 +98,8 @@ static const int BEAM_WIDTH = 10;
 // because the two buy different things and cost very differently: widening
 // here multiplies the work spent on a single turn, which comes straight out
 // of the depth the outer beam can reach.
-#ifndef PLACEMENT_BEAM_WIDTH
-#define PLACEMENT_BEAM_WIDTH BEAM_WIDTH
-#endif
+static const int NESTED_BEAM_WIDTH = 10;
+
 // Upper bound on how many turn plans one state expands into, i.e. how many
 // of the intra-turn beam's survivors the outer beam actually simulates. It
 // exists for responsiveness, not for pruning quality: the deadline is only
@@ -750,6 +750,17 @@ public:
             tile.tracksOwner = NEUTRAL_OWNER;
     }
 
+    // Speculative rail placement: sets the owner and hands back what was
+    // there, so the caller can put it back. Only tracksOwner changes, so an
+    // undo is exact — nothing else in the Map depends on it.
+    int setRailOwner(int x, int y, int owner)
+    {
+        Tile &tile = grid.get(x, y);
+        const int previous = tile.tracksOwner;
+        tile.tracksOwner = owner;
+        return previous;
+    }
+
     // A cell is traversable by a connection path if it holds a rail or a town.
     // Rails in an inked region no longer exist, so they never connect.
     bool isConnectable(int x, int y) const
@@ -977,10 +988,14 @@ public:
 // laid on `board`, and what is left of the turn's paint. The intra-turn beam
 // keeps a handful of these alive and extends each by one rail at a time; only
 // `action` outlives the planning.
+// A turn part-way through being decided. It holds no board of its own: the
+// planner keeps a single shared Map and lays this line's `action.cells` on it
+// when it needs to, undoing them afterwards. A Tile owns a vector, so copying
+// a grid is one heap allocation per cell — far more than replaying three
+// rails costs.
 class PlacementLine
 {
 public:
-    Map board;
     ActionSet action;
     int paintLeft = PAINT_PER_TURN;
     // Closest this line's rails have come to each open wish so far, so a
@@ -1153,6 +1168,9 @@ public:
     mutable vector<int> gapPairBest;
     // Index permutation used to rank a round's lines without copying boards.
     vector<int> grownOrder;
+    // The single board every planning call mutates in place, reused across
+    // calls so its per-cell vectors are allocated once and not per turn.
+    Map scratchBoard;
 
     bool outOfTime() const
     {
@@ -1345,7 +1363,7 @@ public:
     //
     // Interruptible: a line that has laid one rail is already a legal turn,
     // just one with paint left over. `statesSeen` counts states built.
-    vector<ActionSet> generateActionSets(const Map &board,
+    vector<ActionSet> generateActionSets(const Map &startBoard,
                                          const vector<pair<int, int>> &wishes,
                                          int owner, int keep, int &statesSeen)
     {
@@ -1355,13 +1373,34 @@ public:
         bool aborted = false;
 
         // Resolved once so scoring never goes back to the town map.
-        const WishGeometry geo = wishGeometry(board, wishes);
+        const WishGeometry geo = wishGeometry(startBoard, wishes);
 
-        vector<PlacementLine> lines(1);
+        // One board for the whole planning, mutated in place. A line's rails
+        // are laid before it is worked on and undone straight after, so every
+        // line sees the same starting position without anyone copying a grid.
+        Map &board = scratchBoard;
         {
             PROFILE(stateCopy);
-            lines[0].board = board;
+            board = startBoard;
         }
+
+        // Owners displaced by the rails currently laid, innermost last.
+        vector<int> undo;
+
+        auto applyLine = [&](const PlacementLine &line)
+        {
+            undo.clear();
+            for (const Coord &c : line.action.cells)
+                undo.push_back(board.setRailOwner(c.x, c.y, owner));
+        };
+        auto undoLine = [&](const PlacementLine &line)
+        {
+            for (size_t i = line.action.cells.size(); i-- > 0;)
+                board.setRailOwner(line.action.cells[i].x,
+                                   line.action.cells[i].y, undo[i]);
+        };
+
+        vector<PlacementLine> lines(1);
         lines[0].paintLeft = PAINT_PER_TURN;
         lines[0].bestPerWish = geo.baseline;
 
@@ -1377,12 +1416,15 @@ public:
                     break;
                 }
 
+                applyLine(line);
+
                 vector<Coord> candidates =
-                    placementCandidates(line.board, line.paintLeft);
+                    placementCandidates(board, line.paintLeft);
 
                 // Nothing affordable left: this line's turn is over.
                 if (candidates.empty())
                 {
+                    undoLine(line);
                     if (!line.action.empty())
                     {
                         finished.push_back(move(line.action));
@@ -1394,19 +1436,13 @@ public:
 
                 for (const Coord &c : candidates)
                 {
-                    // A candidate is a board copy plus a rescore: the grain
-                    // that bounds the overrun.
+                    PROFILE(candidateCreation);
 
                     PlacementLine child;
-                    {
-                        PROFILE(stateCopy);
-                        child.board = line.board;
-                    }
                     child.action = line.action;
 
-                    int cost = line.board.railCost(c.x, c.y);
+                    const int cost = board.railCost(c.x, c.y);
                     child.paintLeft = line.paintLeft - cost;
-                    child.board.placeRail(c.x, c.y, owner);
                     child.action.cells.push_back(c);
                     child.action.cost += cost;
 
@@ -1416,6 +1452,8 @@ public:
 
                     grown.push_back(move(child));
                 }
+
+                undoLine(line);
 
                 if (aborted)
                     break;
@@ -1439,10 +1477,8 @@ public:
 
             // Reduce to the beam width before spending another rail on them.
             //
-            // Ordering an index permutation rather than the lines themselves:
-            // a PlacementLine owns a whole Map, so every swap std::sort makes
-            // would otherwise copy a board. Only the best `keep` are needed,
-            // so the tail is left unordered.
+            // Ordering an index permutation rather than the lines themselves,
+            // so a swap moves an int instead of a line's vectors.
             {
                 PROFILE(sortRoundLines);
                 const int survivors = min<int>(keep, (int)grown.size());
@@ -1894,21 +1930,14 @@ public:
                 int placementStates = 0;
                 vector<ActionSet> foeTurns =
                     generateActionSets(node.state, wishes, foeId,
-                                       1, placementStates);
+                                       NESTED_BEAM_WIDTH, placementStates);
                 vector<Coord> foeRails;
                 if (!foeTurns.empty())
                     foeRails = foeTurns.front().cells;
 
-                // Our own turn, kept as several alternatives: each is a
-                // different way of spending this turn's paint, and the outer
-                // beam picks between them on what the whole turn is worth
-                // once the opponent's rails and both disrupts have landed.
-                int keep = (MAX_BRANCHING > 0)
-                               ? min((int)PLACEMENT_BEAM_WIDTH, MAX_BRANCHING)
-                               : (int)PLACEMENT_BEAM_WIDTH;
                 vector<ActionSet> myTurns =
                     generateActionSets(node.state, wishes, myId,
-                                       keep, placementStates);
+                                       NESTED_BEAM_WIDTH, placementStates);
                 stats.actionsCreated[depth] += (int)myTurns.size();
                 stats.placementStates[depth] += placementStates;
 
@@ -2147,6 +2176,7 @@ int main()
         PRINT_PROFILE(beamSearch);
         PRINT_PROFILE(placementCandidates);
         PRINT_PROFILE(generateActionSets);
+        PRINT_PROFILE(candidateCreation);
         PRINT_PROFILE(buildDisruptChoice);
         PRINT_PROFILE(simulateTurn);
         PRINT_PROFILE(evaluate);
