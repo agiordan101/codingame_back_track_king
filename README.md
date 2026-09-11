@@ -124,6 +124,8 @@ Each time we want a A* distance, verify if a cache entry exist :
 - Créer une heuristic
 - Timeout quand map pleine ?
 - Timeout quand une town est isolé ?
+- partial_sort to BEAM_WIDTH instead of a full sort
+- Cache/incrementalize openGapTotal — the single highest-value change. It re-does a full multi-component flood-fill per node when consecutive nodes differ by only ~3 rails.
 <!-- - openGapTotal prends 1/2 du temps total.. Supprimer entierement et refaire le cache a* avec invalidation quand région supprimé. -->
 <!-- - Lister les endroits ou on fait des floodfill/a* et mettre en cache tout ça -->
 - Ne pas créer des moves uniquement sur les groupe de rails des villes pas encore lié :

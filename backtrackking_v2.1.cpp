@@ -126,6 +126,7 @@ static const int NESTED_BEAM_WIDTH = 40;
 // tested between expansions, so a node that expands everything overshoots the
 // budget by a whole depth's worth of work. Set to 0 to disable, in which case
 // the intra-turn beam width (BEAM_WIDTH) is the only bound.
+static const int MAX_BRANCHING = 20;
 static const int MAX_DEPTH = 10;
 static const int PAINT_PER_TURN = 3;
 
