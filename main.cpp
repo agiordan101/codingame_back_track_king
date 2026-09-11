@@ -7,6 +7,12 @@
 // - Greedy 3-paint-point rail application, A*-guided, NORTH/EAST/SOUTH/WEST
 //     tie-breaking
 
+#undef _GLIBCXX_DEBUG
+#pragma GCC optimize("Ofast,unroll-loops,omit-frame-pointer,inline")
+#pragma GCC option("arch=native", "tune=native", "no-zero-upper")
+#pragma GCC target( \
+    "movbe,aes,pclmul,avx,avx2,f16c,fma,sse3,ssse3,sse4.1,sse4.2,rdrnd,popcnt,bmi,bmi2,lzcnt")
+
 #include <iostream>
 #include <string>
 #include <vector>
@@ -70,7 +76,7 @@ public:
 // Profile declarations
 DECLARE_PROFILE(beamSearch)
 DECLARE_PROFILE(placementCandidates)
-DECLARE_PROFILE(planTurnPlacements)
+DECLARE_PROFILE(generateActionSets)
 DECLARE_PROFILE(disruptChoice)
 DECLARE_PROFILE(simulateTurn)
 DECLARE_PROFILE(evaluate)
@@ -99,13 +105,6 @@ static const int BEAM_WIDTH = 10;
 // the intra-turn beam width (BEAM_WIDTH) is the only bound.
 static const int MAX_BRANCHING = 20;
 static const int MAX_DEPTH = 10;
-// How many of the scanned candidate cells are actually scored each round.
-// The scan itself stays deliberately unselective — it returns every legal
-// cell touching the network, a few hundred on a dense board — but scoring one
-// costs a board copy plus a full rescore, so scoring all of them is far
-// beyond a turn's budget. They are ranked by a cheap distance test first and
-// only the best survive. Set to 0 to score every candidate.
-static const int MAX_CANDIDATES = 20;
 static const int PAINT_PER_TURN = 3;
 
 // Wall-clock budget for one turn's search. The referee allows 50 ms per turn
@@ -978,6 +977,9 @@ public:
     Map board;
     ActionSet action;
     int paintLeft = PAINT_PER_TURN;
+    // Closest this line's rails have come to each open wish so far, so a
+    // child only has to fold in the one cell it adds.
+    vector<int> bestPerWish;
 };
 
 // ====================
@@ -1137,19 +1139,15 @@ public:
     // the hottest function in the search does not allocate.
     mutable vector<int> gapLabel;
     mutable vector<int> gapQueue;
-    mutable vector<vector<int>> gapCells;
-
-    // Set while the search is producing the first legal move of the turn.
-    // Everything below tests the clock, and on a big enough board the budget
-    // can expire before even one candidate exists — which would make us play
-    // WAIT and forfeit the turn's paint. Overrunning slightly beats that, so
-    // the clock is ignored until there is something to play.
-    bool mustFinish = false;
+    // Per-component distance fields, laid out [component * N + cell].
+    mutable vector<int> gapDist;
+    // BFS frontier of (cell, component) pairs, packed as cell * components + component.
+    mutable vector<int> gapFrontier;
+    // Shortest route found between each ordered pair of components.
+    mutable vector<int> gapPairBest;
 
     bool outOfTime() const
     {
-        if (mustFinish)
-            return false;
         return std::chrono::steady_clock::now() >= deadline;
     }
 
@@ -1221,6 +1219,70 @@ public:
 
     // ---- turn planning ----
 
+    // The wishes one planning call can act on, resolved to coordinates up
+    // front. Purely a cache: every field is derivable from `wishes` plus the
+    // board, and it exists only because the alternative is two std::map
+    // lookups per wish per candidate on the hottest path in the search.
+    //
+    // It also fixes the indexing. Towns that no longer exist are dropped here
+    // once, so `townA[i]`, `townB[i]` and a line's `bestPerWish[i]` all agree
+    // on what `i` means; walking `wishes` directly would have to re-skip those
+    // entries and the indices would drift.
+    class WishGeometry
+    {
+    public:
+        vector<Coord> townA, townB;
+        // Straight-line distance of each wish with nothing built: the value a
+        // line's per-wish best starts at.
+        vector<int> baseline;
+    };
+
+    static WishGeometry wishGeometry(const Map &board,
+                                     const vector<pair<int, int>> &wishes)
+    {
+        WishGeometry geo;
+        for (const auto &wish : wishes)
+        {
+            if (!board.hasTown(wish.first) || !board.hasTown(wish.second))
+                continue;
+            Coord ta = board.townCoordOf(wish.first);
+            Coord tb = board.townCoordOf(wish.second);
+            geo.townA.push_back(ta);
+            geo.townB.push_back(tb);
+            geo.baseline.push_back(abs(ta.x - tb.x) + abs(ta.y - tb.y));
+        }
+        return geo;
+    }
+
+    // Straight-line stand-in for the real gap, used to rank turns while they
+    // are still being built: for each open wish, the shortest Manhattan
+    // distance from either of its towns to a cell the line has laid this
+    // turn. No rail groups and no flood fill.
+    //
+    // It is deliberately not the true gap — it cannot see whether a rail
+    // actually joins anything. That accuracy is not worth its price here,
+    // because every surviving line is rescored with the real heuristic once
+    // the turn is played, and a line that only looked good under this
+    // approximation is discarded there.
+    //
+    // Folds one newly laid cell into a line's per-wish bests and returns the
+    // new total. A child differs from its parent by exactly one cell, so the
+    // whole score is never recomputed: each candidate costs one pass over the
+    // wishes rather than one pass over wishes times cells laid.
+    static int extendManhattanGap(const WishGeometry &geo, Coord laid,
+                                  vector<int> &bestPerWish)
+    {
+        int total = 0;
+        for (size_t i = 0; i < geo.baseline.size(); i++)
+        {
+            int da = abs(laid.x - geo.townA[i].x) + abs(laid.y - geo.townA[i].y);
+            int db = abs(laid.x - geo.townB[i].x) + abs(laid.y - geo.townB[i].y);
+            bestPerWish[i] = min(bestPerWish[i], max(da, db));
+            total += bestPerWish[i];
+        }
+        return total;
+    }
+
     // Ranks two turn plans: the one that leaves the least gap wins, and among
     // plans that leave the same gap, the one that spent more paint — unspent
     // paint is simply lost at the end of the turn.
@@ -1231,23 +1293,9 @@ public:
         return a.cost > b.cost;
     }
 
-    // Every cell a rail could legally go on this turn that actually touches
-    // the existing network: the free neighbours of every rail and every town.
-    //
-    // No attempt is made to work out which of them helps. That used to be the
-    // job here — the list was the free neighbours of the two cells bringing
-    // one wish's groups closest — but it meant re-deriving both rail groups of
-    // every open wish on every intermediate state, two flood fills per wish,
-    // which is where the turn's time went. The nested beam already scores
-    // every candidate on the board it produces and keeps only the best, so a
-    // useless cell is discarded by the search a moment later. Generating it is
-    // far cheaper than reasoning about it.
-    //
-    // `paintLeft` drops terrain the turn can no longer afford, which is also
-    // what ends a turn: with no paint left there is no candidate.
-    static vector<Coord> placementCandidates(const Map &board,
-                                             const vector<pair<int, int>> &wishes,
-                                             int paintLeft)
+    // Every affordable cell touching the network. No attempt to judge which
+    // helps: the beam scores them all and keeps the best.
+    static vector<Coord> placementCandidates(const Map &board, int paintLeft)
     {
         PROFILE(placementCandidates);
 
@@ -1257,23 +1305,16 @@ public:
 
         const int W = board.width(), H = board.height();
 
-        // Ranked by a cheap town-to-town test, never by anything that has to
-        // walk the rail network: lower is better.
-        vector<pair<int, Coord>> ranked;
-
         for (int y = 0; y < H; y++)
         {
             for (int x = 0; x < W; x++)
             {
-                // A cell is a candidate on its own merits, so it is tested
-                // once and never through a neighbour: no dedup needed.
                 if (!board.canPlaceRail(x, y))
                     continue;
                 if (board.railCost(x, y) > paintLeft)
                     continue;
 
-                // Touching the network is the only thing asked of it. A rail
-                // floating in open ground joins nothing and can never pay.
+                // A rail in open ground joins nothing and can never pay.
                 bool touches = false;
                 for (int k = 0; k < 4 && !touches; k++)
                 {
@@ -1281,74 +1322,32 @@ public:
                     if (board.inBounds(nx, ny) && board.isConnectable(nx, ny))
                         touches = true;
                 }
-                if (!touches)
-                    continue;
-
-                // How near this cell sits to the straight line between some
-                // pair of towns that still want each other. Purely arithmetic
-                // on town coordinates — no groups, no flood fill — so it stays
-                // as cheap as the scan itself. It decides nothing: a cell that
-                // ranks badly is merely scored later, and the beam still has
-                // the final say on every cell it does score.
-                int bestDetour = INT_MAX;
-                for (const auto &wish : wishes)
-                {
-                    if (!board.hasTown(wish.first) || !board.hasTown(wish.second))
-                        continue;
-                    Coord ta = board.townCoordOf(wish.first);
-                    Coord tb = board.townCoordOf(wish.second);
-                    int da = abs(x - ta.x) + abs(y - ta.y);
-                    int db = abs(x - tb.x) + abs(y - tb.y);
-                    int direct = abs(ta.x - tb.x) + abs(ta.y - tb.y);
-                    bestDetour = min(bestDetour, da + db - direct);
-                }
-                ranked.push_back({bestDetour, Coord(x, y)});
+                if (touches)
+                    cells.push_back(Coord(x, y));
             }
         }
 
-        if (MAX_CANDIDATES > 0 && (int)ranked.size() > MAX_CANDIDATES)
-        {
-            partial_sort(ranked.begin(), ranked.begin() + MAX_CANDIDATES,
-                         ranked.end(),
-                         [](const pair<int, Coord> &a, const pair<int, Coord> &b)
-                         { return a.first < b.first; });
-            ranked.resize(MAX_CANDIDATES);
-        }
-
-        cells.reserve(ranked.size());
-        for (const auto &r : ranked)
-            cells.push_back(r.second);
         return cells;
     }
 
-    // One turn's building, decided one rail at a time rather than as a route
-    // planned up front. Each step lists the cells worth laying right now,
-    // extends every surviving line with each of them, keeps the `keep` best,
-    // and lists again from the boards those rails produced — so a line's
-    // second rail is chosen knowing where its first one went, and a rail that
-    // opens up a better continuation is free to win on that.
+    // One turn's rails, decided one at a time: each round extends every
+    // surviving line by one cell and keeps the `keep` best, so a line's second
+    // rail is chosen knowing where its first went. A line ends when its paint
+    // buys nothing; results come back best first.
     //
-    // A line finishes when its remaining paint can buy nothing; the finished
-    // lines come back best first. Nothing here touches the caller's board,
-    // because both players' rails have to land on the same turn.
-    //
-    // The turn's clock is respected down to the individual rail: this is the
-    // single most expensive thing the search does, so letting it run to
-    // completion once entered is what used to push the turn past its budget.
-    // Cutting it short is safe because a line that has laid one rail is
-    // already a legal turn — just one that leaves paint unspent — so an
-    // aborted run still hands back something playable.
-    //
-    // `statesSeen` accumulates the intermediate states built, for stats.
-    vector<ActionSet> planTurnPlacements(const Map &board,
+    // Interruptible: a line that has laid one rail is already a legal turn,
+    // just one with paint left over. `statesSeen` counts states built.
+    vector<ActionSet> generateActionSets(const Map &board,
                                          const vector<pair<int, int>> &wishes,
-                                         int owner, int keep, int &statesSeen,
-                                         bool needMove = false)
+                                         int owner, int keep, int &statesSeen)
     {
-        PROFILE(planTurnPlacements);
+        PROFILE(generateActionSets);
 
         vector<ActionSet> finished;
         bool aborted = false;
+
+        // Resolved once so scoring never goes back to the town map.
+        const WishGeometry geo = wishGeometry(board, wishes);
 
         vector<PlacementLine> lines(1);
         {
@@ -1356,23 +1355,10 @@ public:
             lines[0].board = board;
         }
         lines[0].paintLeft = PAINT_PER_TURN;
-
-        // Until one rail is down, the turn has nothing to play, so the
-        // search is allowed to overrun to get that far. The guarantee is
-        // deliberately as small as it can be — one line extended by one
-        // rail, not a whole round — because everything it covers is time
-        // spent past the budget. Later rails, the other lines and the
-        // opponent's planning are all optional, and stay bounded.
-        bool guarantee = needMove;
+        lines[0].bestPerWish = geo.baseline;
 
         while (!lines.empty())
         {
-            // Armed before any clock test, so the guarantee cannot be
-            // skipped past by the very checks it exists to override.
-            mustFinish = guarantee;
-
-            // A whole extra rail round is about to start. Everything the
-            // earlier rounds finished is already in `finished`.
             if (outOfTime())
             {
                 aborted = true;
@@ -1383,12 +1369,6 @@ public:
 
             for (PlacementLine &line : lines)
             {
-                // Only the line still under the guarantee ignores the clock,
-                // and only until it has produced a rail.
-                mustFinish = guarantee;
-
-                // Listing a line's candidates re-derives both groups of every
-                // open wish, so it is worth a check of its own.
                 if (outOfTime())
                 {
                     aborted = true;
@@ -1396,28 +1376,24 @@ public:
                 }
 
                 vector<Coord> candidates =
-                    placementCandidates(line.board, wishes, line.paintLeft);
+                    placementCandidates(line.board, line.paintLeft);
 
-                // Out of paint, or paint left with nowhere useful to spend it:
-                // either way this line's turn is over.
+                // Nothing affordable left: this line's turn is over.
                 if (candidates.empty())
                 {
                     if (!line.action.empty())
                     {
                         finished.push_back(move(line.action));
-                        // Moved from, so the abort harvest below skips it.
+                        // Moved from, so the abort harvest skips it.
                         line.action.cells.clear();
                     }
-                    // Still nothing to play, so the guarantee stays armed for
-                    // whichever line does manage to produce a rail.
                     continue;
                 }
 
                 for (const Coord &c : candidates)
                 {
-                    // One candidate is a board copy plus a full rescore, the
-                    // grain the whole planner is built out of: checking here
-                    // is what bounds the overrun.
+                    // A candidate is a board copy plus a rescore: the grain
+                    // that bounds the overrun.
                     if (outOfTime())
                     {
                         aborted = true;
@@ -1436,17 +1412,13 @@ public:
                     child.board.placeRail(c.x, c.y, owner);
                     child.action.cells.push_back(c);
                     child.action.cost += cost;
-                    child.action.resultingGap = openGapTotal(child.board, wishes);
+
+                    child.bestPerWish = line.bestPerWish;
+                    child.action.resultingGap =
+                        extendManhattanGap(geo, c, child.bestPerWish);
 
                     grown.push_back(move(child));
-
-                    // A rail is down: there is a move to play, so the clock
-                    // is back in charge for everything that follows.
-                    guarantee = false;
-                    mustFinish = false;
                 }
-
-                mustFinish = false;
 
                 if (aborted)
                     break;
@@ -1456,10 +1428,7 @@ public:
 
             if (aborted)
             {
-                // Time ran out part-way through a round. Every line still
-                // alive is a legal turn already, and so is every child the
-                // round did manage to build, so both are kept instead of
-                // being thrown away; the final ranking below sorts them out.
+                // Keep whatever is already playable rather than drop it.
                 for (PlacementLine &line : lines)
                     if (!line.action.empty())
                         finished.push_back(move(line.action));
@@ -1481,14 +1450,10 @@ public:
             lines = move(grown);
         }
 
-        // Lines finish at different steps — a mountain ends a turn in one
-        // rail, plains take three — so the survivors are ranked together
-        // here rather than at whichever step produced them.
+        // Lines finish at different rounds, so rank the survivors together.
         sort(finished.begin(), finished.end(), betterPlacement);
         if ((int)finished.size() > keep)
             finished.resize(keep);
-
-        mustFinish = false;
 
         if (aborted)
             stats.placementsTruncated++;
@@ -1626,16 +1591,10 @@ public:
     // the wishes already measured stand and the rest are treated as closed,
     // which understates the gap. That biases a score the search is about to
     // stop trusting anyway, and is much cheaper than overrunning the turn.
-    int openGapTotal(const Map &board, const vector<pair<int, int>> &wishes) const
+    // Labels every rail/town cell with the component it belongs to, -1
+    // elsewhere. Returns the number of components.
+    int labelComponents(const Map &board) const
     {
-        PROFILE(openGapTotal);
-
-        // One pass over the board labels every rail/town component, instead of
-        // flooding once per town and then comparing every cell of one group
-        // against every cell of the other. That cross product was quadratic in
-        // the size of the rail network and ran for every candidate cell the
-        // scan proposes, which is what made scoring the bottleneck once
-        // candidate generation stopped filtering.
         const int W = board.width(), H = board.height();
         const int N = W * H;
 
@@ -1644,9 +1603,7 @@ public:
 
         for (int start = 0; start < N; start++)
         {
-            if (gapLabel[start] != -1)
-                continue;
-            if (!board.isConnectable(start % W, start / W))
+            if (gapLabel[start] != -1 || !board.isConnectable(start % W, start / W))
                 continue;
 
             const int label = components++;
@@ -1656,62 +1613,136 @@ public:
 
             for (size_t head = 0; head < gapQueue.size(); head++)
             {
-                const int cur = gapQueue[head];
-                const int cx = cur % W, cy = cur / W;
+                const int cx = gapQueue[head] % W, cy = gapQueue[head] / W;
                 for (int k = 0; k < 4; k++)
                 {
                     const int nx = cx + DIR_X[k], ny = cy + DIR_Y[k];
                     if (nx < 0 || nx >= W || ny < 0 || ny >= H)
                         continue;
                     const int nIdx = ny * W + nx;
-                    if (gapLabel[nIdx] != -1)
-                        continue;
-                    if (!board.isConnectable(nx, ny))
+                    if (gapLabel[nIdx] != -1 || !board.isConnectable(nx, ny))
                         continue;
                     gapLabel[nIdx] = label;
                     gapQueue.push_back(nIdx);
                 }
             }
         }
+        return components;
+    }
 
-        // Cells of each component, so a wish only scans the two it needs.
-        gapCells.assign(components, {});
+    // Records a route of `total` cells between two components, keeping the
+    // shortest seen. Symmetric.
+    void recordPair(int a, int b, int components, int total) const
+    {
+        int &slot = gapPairBest[(size_t)a * components + b];
+        if (total < slot)
+        {
+            slot = total;
+            gapPairBest[(size_t)b * components + a] = total;
+        }
+    }
+
+    // Every component floods outwards at once over buildable ground. Where two
+    // floods meet, their distances sum to a shortest connecting route, so one
+    // pass settles every pair. Fills gapPairBest.
+    void floodComponentDistances(const Map &board, int components) const
+    {
+        const int W = board.width(), H = board.height();
+        const int N = W * H;
+
+        gapDist.assign((size_t)components * N, -1);
+        gapPairBest.assign((size_t)components * components, INT_MAX);
+        gapFrontier.clear();
+
         for (int idx = 0; idx < N; idx++)
             if (gapLabel[idx] != -1)
-                gapCells[gapLabel[idx]].push_back(idx);
+            {
+                gapDist[(size_t)gapLabel[idx] * N + idx] = 0;
+                gapFrontier.push_back(idx * components + gapLabel[idx]);
+            }
+
+        for (size_t head = 0; head < gapFrontier.size(); head++)
+        {
+            const int label = gapFrontier[head] % components;
+            const int cur = gapFrontier[head] / components;
+            const int d = gapDist[(size_t)label * N + cur];
+            const int cx = cur % W, cy = cur / W;
+
+            for (int k = 0; k < 4; k++)
+            {
+                const int nx = cx + DIR_X[k], ny = cy + DIR_Y[k];
+                if (nx < 0 || nx >= W || ny < 0 || ny >= H)
+                    continue;
+                const int nIdx = ny * W + nx;
+                const int other = gapLabel[nIdx];
+
+                // Reached another component: adjacent, so the route ends here.
+                if (other != -1)
+                {
+                    if (other != label)
+                        recordPair(label, other, components, d);
+                    continue;
+                }
+                // Ink and impassable terrain stop a flood, so a reported gap
+                // is a route that could really be built.
+                if (!board.canPlaceRail(nx, ny))
+                    continue;
+
+                int &nd = gapDist[(size_t)label * N + nIdx];
+                if (nd != -1)
+                    continue;
+                nd = d + 1;
+                gapFrontier.push_back(nIdx * components + label);
+
+                // Any other flood already here meets this one.
+                for (int o = 0; o < components; o++)
+                {
+                    if (o == label)
+                        continue;
+                    const int od = gapDist[(size_t)o * N + nIdx];
+                    if (od != -1)
+                        recordPair(label, o, components, nd + od);
+                }
+            }
+        }
+    }
+
+    // Distance still separating the two towns of `wish`, or -1 when there is
+    // nothing to measure: a town with no component, or both on the same one.
+    int wishGap(const Map &board, const pair<int, int> &wish, int components) const
+    {
+        if (!board.hasTown(wish.first) || !board.hasTown(wish.second))
+            return -1;
+
+        const int W = board.width();
+        Coord ca = board.townCoordOf(wish.first), cb = board.townCoordOf(wish.second);
+        const int la = gapLabel[ca.y * W + ca.x], lb = gapLabel[cb.y * W + cb.x];
+        if (la == -1 || lb == -1 || la == lb)
+            return -1;
+
+        const int best = gapPairBest[(size_t)la * components + lb];
+        // Walled apart by ink or impassable terrain: nothing to steer towards.
+        return best == INT_MAX ? -1 : best;
+    }
+
+    int openGapTotal(const Map &board, const vector<pair<int, int>> &wishes) const
+    {
+        PROFILE(openGapTotal);
+
+        const int components = labelComponents(board);
+        if (components == 0)
+            return 0;
+        floodComponentDistances(board, components);
 
         int gap = 0;
-
         for (const auto &wish : wishes)
         {
             if (outOfTime())
                 break;
-
-            int a = wish.first, b = wish.second;
-            if (!board.hasTown(a) || !board.hasTown(b))
-                continue;
-
-            Coord ca = board.townCoordOf(a), cb = board.townCoordOf(b);
-            const int la = gapLabel[ca.y * W + ca.x];
-            const int lb = gapLabel[cb.y * W + cb.x];
-            // A town with no component at all: nothing to measure.
-            if (la == -1 || lb == -1)
-                continue;
-            // Same component: the towns already touch, so the wish is closed.
-            if (la == lb)
-                continue;
-
-            int best = INT_MAX;
-            for (int ia : gapCells[la])
-            {
-                const int ax = ia % W, ay = ia / W;
-                for (int ib : gapCells[lb])
-                    best = min(best, abs(ax - ib % W) + abs(ay - ib / W));
-            }
-            if (best != INT_MAX)
-                gap += best;
+            const int d = wishGap(board, wish, components);
+            if (d >= 0)
+                gap += d;
         }
-
         return gap;
     }
 
@@ -1823,20 +1854,11 @@ public:
         BeamNode root;
         root.state = *startBoard;
         root.active = startActive;
-        // Nothing simulated yet, so nothing banked: the root is judged on its
-        // open gaps alone. Scored with the clock ignored, because a root whose
-        // gaps went unmeasured would be a meaningless baseline for every child
-        // that gets compared against it.
-        mustFinish = true;
+        // Nothing banked yet, so the root scores on its open gaps alone.
         root.score = evaluate(root.state, wishes, 0, 0, 0);
-        mustFinish = false;
 
         vector<BeamNode> beam{root};
 
-        // Whether any turn planning has run yet this turn. Until one has, the
-        // search has no move to fall back on, so the first one is allowed to
-        // ignore the clock.
-        bool anyPlanYet = false;
 
         // A depth no longer has to fit entirely in the remaining time: it is
         // always entered, and abandoned mid-way when the deadline hits. The
@@ -1871,7 +1893,7 @@ public:
                 // not get to pick from several after seeing ours.
                 int placementStates = 0;
                 vector<ActionSet> foeTurns =
-                    planTurnPlacements(node.state, wishes, foeId,
+                    generateActionSets(node.state, wishes, foeId,
                                        1, placementStates);
                 vector<Coord> foeRails;
                 if (!foeTurns.empty())
@@ -1884,15 +1906,9 @@ public:
                 int keep = (MAX_BRANCHING > 0)
                                ? min((int)PLACEMENT_BEAM_WIDTH, MAX_BRANCHING)
                                : (int)PLACEMENT_BEAM_WIDTH;
-                // The first depth-0 planning of the turn is the one whose
-                // result we fall back on if everything after it is cut short,
-                // so it alone may overrun rather than hand back nothing. Once
-                // it has run, the rest of the beam is bounded normally.
-                bool needMove = (depth == 0 && !anyPlanYet);
                 vector<ActionSet> myTurns =
-                    planTurnPlacements(node.state, wishes, myId,
-                                       keep, placementStates, needMove);
-                anyPlanYet = true;
+                    generateActionSets(node.state, wishes, myId,
+                                       keep, placementStates);
                 stats.actionsCreated[depth] += (int)myTurns.size();
                 stats.placementStates[depth] += placementStates;
 
@@ -2128,7 +2144,7 @@ int main()
 
         PRINT_PROFILE(beamSearch);
         PRINT_PROFILE(placementCandidates);
-        PRINT_PROFILE(planTurnPlacements);
+        PRINT_PROFILE(generateActionSets);
         PRINT_PROFILE(disruptChoice);
         PRINT_PROFILE(simulateTurn);
         PRINT_PROFILE(evaluate);
