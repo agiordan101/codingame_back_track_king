@@ -83,6 +83,10 @@ DECLARE_PROFILE(evaluate)
 DECLARE_PROFILE(railGroupOf)
 DECLARE_PROFILE(stateCopy)
 DECLARE_PROFILE(openGapTotal)
+DECLARE_PROFILE(sortRegionIds)
+DECLARE_PROFILE(sortRoundLines)
+DECLARE_PROFILE(sortFinishedLines)
+DECLARE_PROFILE(sortBeam)
 
 // ====================
 // CONSTANTS
@@ -781,7 +785,10 @@ public:
         ids.reserve(regionById.size());
         for (auto &kv : regionById)
             ids.push_back(kv.first);
-        sort(ids.begin(), ids.end());
+        {
+            PROFILE(sortRegionIds);
+            sort(ids.begin(), ids.end());
+        }
         return ids;
     }
 
@@ -1144,6 +1151,8 @@ public:
     mutable vector<int> gapFrontier;
     // Shortest route found between each ordered pair of components.
     mutable vector<int> gapPairBest;
+    // Index permutation used to rank a round's lines without copying boards.
+    vector<int> grownOrder;
 
     bool outOfTime() const
     {
@@ -1429,17 +1438,37 @@ public:
                 break;
 
             // Reduce to the beam width before spending another rail on them.
-            sort(grown.begin(), grown.end(),
-                 [](const PlacementLine &a, const PlacementLine &b)
-                 { return betterPlacement(a.action, b.action); });
-            if ((int)grown.size() > keep)
-                grown.resize(keep);
+            //
+            // Ordering an index permutation rather than the lines themselves:
+            // a PlacementLine owns a whole Map, so every swap std::sort makes
+            // would otherwise copy a board. Only the best `keep` are needed,
+            // so the tail is left unordered.
+            {
+                PROFILE(sortRoundLines);
+                const int survivors = min<int>(keep, (int)grown.size());
 
-            lines = move(grown);
+                grownOrder.resize(grown.size());
+                for (size_t i = 0; i < grown.size(); i++)
+                    grownOrder[i] = (int)i;
+
+                partial_sort(grownOrder.begin(), grownOrder.begin() + survivors,
+                             grownOrder.end(),
+                             [&grown](int a, int b)
+                             { return betterPlacement(grown[a].action,
+                                                      grown[b].action); });
+
+                lines.clear();
+                lines.reserve(survivors);
+                for (int i = 0; i < survivors; i++)
+                    lines.push_back(move(grown[grownOrder[i]]));
+            }
         }
 
         // Lines finish at different rounds, so rank the survivors together.
-        sort(finished.begin(), finished.end(), betterPlacement);
+        {
+            PROFILE(sortFinishedLines);
+            sort(finished.begin(), finished.end(), betterPlacement);
+        }
         if ((int)finished.size() > keep)
             finished.resize(keep);
 
@@ -1966,9 +1995,12 @@ public:
                     nextBeam.push_back(move(node));
             }
 
-            sort(nextBeam.begin(), nextBeam.end(),
-                 [](const BeamNode &a, const BeamNode &b)
-                 { return a.score > b.score; });
+            {
+                PROFILE(sortBeam);
+                sort(nextBeam.begin(), nextBeam.end(),
+                     [](const BeamNode &a, const BeamNode &b)
+                     { return a.score > b.score; });
+            }
             if ((int)nextBeam.size() > BEAM_WIDTH)
                 nextBeam.resize(BEAM_WIDTH);
 
@@ -2122,5 +2154,9 @@ int main()
         PRINT_PROFILE(railGroupOf);
         PRINT_PROFILE(stateCopy);
         PRINT_PROFILE(openGapTotal);
+        PRINT_PROFILE(sortRegionIds);
+        PRINT_PROFILE(sortRoundLines);
+        PRINT_PROFILE(sortFinishedLines);
+        PRINT_PROFILE(sortBeam);
     }
 }
