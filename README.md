@@ -121,10 +121,11 @@ Each time we want a A* distance, verify if a cache entry exist :
 
 ## Next steps
 
-- openGapTotal prends 1/2 du temps total.. Supprimer entierement et refaire le cache a* avec invalidation quand région supprimé.
-- Lister les endroits ou on fait des floodfill/a* et mettre en cache tout ça
-- Eviter les cross-products
 - Créer une heuristic
+- Timeout quand map pleine ?
+- Timeout quand une town est isolé ?
+<!-- - openGapTotal prends 1/2 du temps total.. Supprimer entierement et refaire le cache a* avec invalidation quand région supprimé. -->
+<!-- - Lister les endroits ou on fait des floodfill/a* et mettre en cache tout ça -->
 - Ne pas créer des moves uniquement sur les groupe de rails des villes pas encore lié :
     - Creer des moves sur les fin de chemin vers le rail le plus proche qui n'est pas du même groupe 
 
@@ -152,9 +153,8 @@ interruptible, playing the best line found when the turn budget runs out.
 - Disrupt choice: the region where the opponent owns the most connection
     rails more than we do. Four disrupts ink a region and erase its rails.
 
-### v1.2
-
-### v1.1
+Last moment in arena: -
+First moment in arena: 191/558 Bronze
 
 ### v1.0
 
@@ -164,7 +164,7 @@ interruptible, playing the best line found when the turn budget runs out.
     not containing one of our/their towns (can't disrupt those),
     preferring the one closest to being inked / with the most rails
 
-Last moment in arena: 
+Last moment in arena: 580/115 Bronze
 First moment in arena: 191/558 Bronze
 
 ### v0.2

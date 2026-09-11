@@ -1,0 +1,5 @@
+[project]
+environment = "firstenv"
+preset = "summer2026"
+league = "bronze"
+# challenge = "summer2026"  # uncomment to link CG online stats
