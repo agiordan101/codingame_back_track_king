@@ -121,6 +121,8 @@ Each time we want a A* distance, verify if a cache entry exist :
 
 ## Next steps
 
+- Améliorer le PROFILE pour avoir la moyenne par tour de jeu
+- openGapTotal prends 1/2 du temps total.. Supprimer entierement et refaire le cache a* avec invalidation quand région supprimé.
 - Lister les endroits ou on fait des floodfill/a* et mettre en cache tout ça
 - Eviter les cross-products
 - Créer une heuristic

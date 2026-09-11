@@ -160,7 +160,6 @@ public:
     int tracksOwner;
     bool inked;
     int instability;
-    vector<Connection> partOfActiveConnections;
     Tile(int r = 0, int t = 0)
         : regionId(r), type(t), tracksOwner(NO_OWNER), inked(false), instability(0) {}
 };
@@ -658,7 +657,6 @@ public:
                 string inkedStr, partStr;
                 in >> tracksOwner >> instability >> inkedStr >> partStr;
                 bool inked = (inkedStr != "0");
-                vector<Connection> connections;
                 if (partStr != "x")
                 {
                     stringstream ss(partStr);
@@ -667,7 +665,6 @@ public:
                     {
                         int fromTownId, toTownId;
                         sscanf(conn.c_str(), "%d-%d", &fromTownId, &toTownId);
-                        connections.emplace_back(fromTownId, toTownId);
                         outActiveConnections[{fromTownId, toTownId}] = true;
                     }
                 }
@@ -677,7 +674,6 @@ public:
                 tile.tracksOwner = inked ? NO_OWNER : tracksOwner;
                 tile.inked = inked;
                 tile.instability = instability;
-                tile.partOfActiveConnections = connections;
 
                 // Mirror per-tile instability/ink onto the owning region.
                 Region &region = regionById[tile.regionId];
@@ -1160,6 +1156,23 @@ public:
     // the hottest function in the search does not allocate.
     mutable vector<int> gapLabel;
     mutable vector<int> gapQueue;
+    // Generation stamps, so the per-cell buffers are never re-zeroed: a value
+    // counts as present only when its stamp matches the current run. Without
+    // this, every call memset components*N ints (15k+ on a dense board) before
+    // doing any work, which was the bulk of openGapTotal's cost.
+    mutable vector<int> gapLabelStamp;
+    mutable vector<int> gapDistStamp;
+    // Labels and distances are stamped separately: one openGapTotal call is a
+    // single labelling run followed by a single flood run, and bumping one
+    // must not invalidate the other.
+    mutable int gapStamp = 0;
+    mutable int gapDistRun = 0;
+    // Components that have reached a cell, so meeting floods are found by
+    // walking arrivals rather than scanning every component at every cell.
+    mutable vector<int> gapArrivalHead;
+    mutable vector<int> gapArrivalNext;
+    // Cells whose arrival list was used, so only those get reset.
+    mutable vector<int> gapTouched;
     // Per-component distance fields, laid out [component * N + cell].
     mutable vector<int> gapDist;
     // BFS frontier of (cell, component) pairs, packed as cell * components + component.
@@ -1169,8 +1182,11 @@ public:
     // Index permutation used to rank a round's lines without copying boards.
     vector<int> grownOrder;
     // The single board every planning call mutates in place, reused across
-    // calls so its per-cell vectors are allocated once and not per turn.
+    // calls so its buffers are allocated once and not per turn.
     Map scratchBoard;
+    // Planner scratch, reused across calls for the same reason.
+    vector<int> scratchUndo;
+    vector<Coord> scratchCandidates;
 
     bool outOfTime() const
     {
@@ -1321,13 +1337,16 @@ public:
 
     // Every affordable cell touching the network. No attempt to judge which
     // helps: the beam scores them all and keeps the best.
-    static vector<Coord> placementCandidates(const Map &board, int paintLeft)
+    // Fills `cells` rather than returning it: this runs once per line per
+    // round, and a fresh vector each time is a malloc/free pair for nothing.
+    static void placementCandidates(const Map &board, int paintLeft,
+                                    vector<Coord> &cells)
     {
         PROFILE(placementCandidates);
 
-        vector<Coord> cells;
+        cells.clear();
         if (paintLeft <= 0)
-            return cells;
+            return;
 
         const int W = board.width(), H = board.height();
 
@@ -1352,8 +1371,6 @@ public:
                     cells.push_back(Coord(x, y));
             }
         }
-
-        return cells;
     }
 
     // One turn's rails, decided one at a time: each round extends every
@@ -1385,7 +1402,10 @@ public:
         }
 
         // Owners displaced by the rails currently laid, innermost last.
-        vector<int> undo;
+        vector<int> &undo = scratchUndo;
+        // Reused across every line and round, so the planner allocates nothing
+        // per candidate scan.
+        vector<Coord> &candidates = scratchCandidates;
 
         auto applyLine = [&](const PlacementLine &line)
         {
@@ -1404,9 +1424,11 @@ public:
         lines[0].paintLeft = PAINT_PER_TURN;
         lines[0].bestPerWish = geo.baseline;
 
+        vector<PlacementLine> grown;
+
         while (!lines.empty())
         {
-            vector<PlacementLine> grown;
+            grown.clear();
 
             for (PlacementLine &line : lines)
             {
@@ -1418,8 +1440,7 @@ public:
 
                 applyLine(line);
 
-                vector<Coord> candidates =
-                    placementCandidates(board, line.paintLeft);
+                placementCandidates(board, line.paintLeft, candidates);
 
                 // Nothing affordable left: this line's turn is over.
                 if (candidates.empty())
@@ -1645,18 +1666,27 @@ public:
         const int W = board.width(), H = board.height();
         const int N = W * H;
 
-        gapLabel.assign(N, -1);
+        if ((int)gapLabel.size() != N)
+        {
+            gapLabel.assign(N, -1);
+            gapLabelStamp.assign(N, 0);
+        }
+        gapStamp++;
+        const int stamp = gapStamp;
+
         int components = 0;
 
         for (int start = 0; start < N; start++)
         {
-            if (gapLabel[start] != -1 || !board.isConnectable(start % W, start / W))
+            if (gapLabelStamp[start] == stamp ||
+                !board.isConnectable(start % W, start / W))
                 continue;
 
             const int label = components++;
             gapQueue.clear();
             gapQueue.push_back(start);
             gapLabel[start] = label;
+            gapLabelStamp[start] = stamp;
 
             for (size_t head = 0; head < gapQueue.size(); head++)
             {
@@ -1667,14 +1697,21 @@ public:
                     if (nx < 0 || nx >= W || ny < 0 || ny >= H)
                         continue;
                     const int nIdx = ny * W + nx;
-                    if (gapLabel[nIdx] != -1 || !board.isConnectable(nx, ny))
+                    if (gapLabelStamp[nIdx] == stamp || !board.isConnectable(nx, ny))
                         continue;
                     gapLabel[nIdx] = label;
+                    gapLabelStamp[nIdx] = stamp;
                     gapQueue.push_back(nIdx);
                 }
             }
         }
         return components;
+    }
+
+    // Component at `idx`, or -1 if none. Stale stamps read as absent.
+    int labelAt(int idx) const
+    {
+        return gapLabelStamp[idx] == gapStamp ? gapLabel[idx] : -1;
     }
 
     // Records a route of `total` cells between two components, keeping the
@@ -1697,16 +1734,40 @@ public:
         const int W = board.width(), H = board.height();
         const int N = W * H;
 
-        gapDist.assign((size_t)components * N, -1);
+        const size_t need = (size_t)components * N;
+        if (gapDist.size() < need)
+        {
+            gapDist.resize(need);
+            gapDistStamp.assign(need, 0);
+        }
+        gapDistRun++;
+        const int stamp = gapDistRun;
+
+        // Arrival lists: for each cell, the components that have reached it,
+        // as an intrusive singly-linked list over gapArrivalNext.
+        if ((int)gapArrivalHead.size() != N)
+            gapArrivalHead.assign(N, -1);
+        if (gapArrivalNext.size() < need)
+            gapArrivalNext.resize(need);
+
         gapPairBest.assign((size_t)components * components, INT_MAX);
         gapFrontier.clear();
+        gapTouched.clear();
 
         for (int idx = 0; idx < N; idx++)
-            if (gapLabel[idx] != -1)
-            {
-                gapDist[(size_t)gapLabel[idx] * N + idx] = 0;
-                gapFrontier.push_back(idx * components + gapLabel[idx]);
-            }
+        {
+            const int label = labelAt(idx);
+            if (label == -1)
+                continue;
+            const size_t slot = (size_t)label * N + idx;
+            gapDist[slot] = 0;
+            gapDistStamp[slot] = stamp;
+            gapArrivalNext[slot] = gapArrivalHead[idx];
+            if (gapArrivalHead[idx] == -1)
+                gapTouched.push_back(idx);
+            gapArrivalHead[idx] = label;
+            gapFrontier.push_back(idx * components + label);
+        }
 
         for (size_t head = 0; head < gapFrontier.size(); head++)
         {
@@ -1721,7 +1782,7 @@ public:
                 if (nx < 0 || nx >= W || ny < 0 || ny >= H)
                     continue;
                 const int nIdx = ny * W + nx;
-                const int other = gapLabel[nIdx];
+                const int other = labelAt(nIdx);
 
                 // Reached another component: adjacent, so the route ends here.
                 if (other != -1)
@@ -1735,23 +1796,31 @@ public:
                 if (!board.canPlaceRail(nx, ny))
                     continue;
 
-                int &nd = gapDist[(size_t)label * N + nIdx];
-                if (nd != -1)
+                const size_t slot = (size_t)label * N + nIdx;
+                if (gapDistStamp[slot] == stamp)
                     continue;
-                nd = d + 1;
+                gapDist[slot] = d + 1;
+                gapDistStamp[slot] = stamp;
                 gapFrontier.push_back(nIdx * components + label);
 
-                // Any other flood already here meets this one.
-                for (int o = 0; o < components; o++)
-                {
-                    if (o == label)
-                        continue;
-                    const int od = gapDist[(size_t)o * N + nIdx];
-                    if (od != -1)
-                        recordPair(label, o, components, nd + od);
-                }
+                // Only the floods that have actually arrived here, rather than
+                // every component in the board.
+                for (int o = gapArrivalHead[nIdx]; o != -1;
+                     o = gapArrivalNext[(size_t)o * N + nIdx])
+                    recordPair(label, o, components, gapDist[slot] +
+                                                         gapDist[(size_t)o * N + nIdx]);
+
+                gapArrivalNext[slot] = gapArrivalHead[nIdx];
+                if (gapArrivalHead[nIdx] == -1)
+                    gapTouched.push_back(nIdx);
+                gapArrivalHead[nIdx] = label;
             }
         }
+
+        // Reset only what was used, so the next call starts clean without
+        // touching the whole board.
+        for (int idx : gapTouched)
+            gapArrivalHead[idx] = -1;
     }
 
     // Distance still separating the two towns of `wish`, or -1 when there is
@@ -1763,7 +1832,7 @@ public:
 
         const int W = board.width();
         Coord ca = board.townCoordOf(wish.first), cb = board.townCoordOf(wish.second);
-        const int la = gapLabel[ca.y * W + ca.x], lb = gapLabel[cb.y * W + cb.x];
+        const int la = labelAt(ca.y * W + ca.x), lb = labelAt(cb.y * W + cb.x);
         if (la == -1 || lb == -1 || la == lb)
             return -1;
 
