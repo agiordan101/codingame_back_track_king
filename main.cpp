@@ -998,6 +998,10 @@ public:
     vector<int> statesPerDepth;
     // Nodes whose expansion was cut short by the time budget.
     int truncatedByTime;
+    // Turn plannings the budget cut short. Their plans are still played, but
+    // they leave paint unspent, so a nonzero count here means the search is
+    // handing back turns it had not finished thinking about.
+    int placementsTruncated;
 
     BeamStats() { reset(); }
 
@@ -1006,6 +1010,7 @@ public:
         maxDepth = 0;
         totalStates = 0;
         truncatedByTime = 0;
+        placementsTruncated = 0;
         actionsCreated.assign(MAX_DEPTH, 0);
         placementStates.assign(MAX_DEPTH, 0);
         statesPerDepth.assign(MAX_DEPTH, 0);
@@ -1055,6 +1060,9 @@ public:
         if (truncatedByTime)
             fprintf(stderr, "%-32s time-truncated expansions : %d\n", "beamStats",
                     truncatedByTime);
+        if (placementsTruncated)
+            fprintf(stderr, "%-32s time-truncated turn plans : %d\n", "beamStats",
+                    placementsTruncated);
 
         fprintf(stderr, "%-32s %-7s %12s %12s %14s\n", "beamStats",
                 "depth", "turn plans", "intra-turn", "states created");
@@ -1112,6 +1120,24 @@ public:
     // Turn clock, so the search can stop before the referee's limit.
     std::chrono::steady_clock::time_point turnStart;
     bool firstTurn = true;
+    // When the search has to be finished. Set by run() before anything reads
+    // it, and a member rather than a local because the planning below is deep
+    // enough to need to test it from inside.
+    std::chrono::steady_clock::time_point deadline;
+
+    // Set while the search is producing the first legal move of the turn.
+    // Everything below tests the clock, and on a big enough board the budget
+    // can expire before even one candidate exists — which would make us play
+    // WAIT and forfeit the turn's paint. Overrunning slightly beats that, so
+    // the clock is ignored until there is something to play.
+    bool mustFinish = false;
+
+    bool outOfTime() const
+    {
+        if (mustFinish)
+            return false;
+        return std::chrono::steady_clock::now() >= deadline;
+    }
 
     BeamStats stats;
 
@@ -1208,10 +1234,13 @@ public:
     //
     // `paintLeft` drops terrain the turn can no longer afford, which is also
     // what ends a turn: with no paint left there is no candidate.
-    static vector<Coord> placementCandidates(const Map &board,
-                                             const vector<pair<int, int>> &wishes,
-                                             const map<pair<int, int>, bool> &active,
-                                             int paintLeft)
+    // Interruptible for the same reason openGapTotal is: locating one wish's
+    // gap is two flood fills over groups that can cover much of the board.
+    // Stopping early just means the later wishes offer no cells this turn.
+    vector<Coord> placementCandidates(const Map &board,
+                                      const vector<pair<int, int>> &wishes,
+                                      const map<pair<int, int>, bool> &active,
+                                      int paintLeft) const
     {
         PROFILE(placementCandidates);
 
@@ -1223,6 +1252,9 @@ public:
 
         for (const auto &wish : wishes)
         {
+            if (outOfTime())
+                break;
+
             int a = wish.first, b = wish.second;
             if (active.count({a, b}) || active.count({b, a}))
                 continue;
@@ -1264,15 +1296,24 @@ public:
     // lines come back best first. Nothing here touches the caller's board,
     // because both players' rails have to land on the same turn.
     //
+    // The turn's clock is respected down to the individual rail: this is the
+    // single most expensive thing the search does, so letting it run to
+    // completion once entered is what used to push the turn past its budget.
+    // Cutting it short is safe because a line that has laid one rail is
+    // already a legal turn — just one that leaves paint unspent — so an
+    // aborted run still hands back something playable.
+    //
     // `statesSeen` accumulates the intermediate states built, for stats.
-    static vector<ActionSet> planTurnPlacements(const Map &board,
-                                                const vector<pair<int, int>> &wishes,
-                                                const map<pair<int, int>, bool> &active,
-                                                int owner, int keep, int &statesSeen)
+    vector<ActionSet> planTurnPlacements(const Map &board,
+                                         const vector<pair<int, int>> &wishes,
+                                         const map<pair<int, int>, bool> &active,
+                                         int owner, int keep, int &statesSeen,
+                                         bool needMove = false)
     {
         PROFILE(planTurnPlacements);
 
         vector<ActionSet> finished;
+        bool aborted = false;
 
         vector<PlacementLine> lines(1);
         {
@@ -1281,12 +1322,44 @@ public:
         }
         lines[0].paintLeft = PAINT_PER_TURN;
 
+        // Until one rail is down, the turn has nothing to play, so the
+        // search is allowed to overrun to get that far. The guarantee is
+        // deliberately as small as it can be — one line extended by one
+        // rail, not a whole round — because everything it covers is time
+        // spent past the budget. Later rails, the other lines and the
+        // opponent's planning are all optional, and stay bounded.
+        bool guarantee = needMove;
+
         while (!lines.empty())
         {
+            // Armed before any clock test, so the guarantee cannot be
+            // skipped past by the very checks it exists to override.
+            mustFinish = guarantee;
+
+            // A whole extra rail round is about to start. Everything the
+            // earlier rounds finished is already in `finished`.
+            if (outOfTime())
+            {
+                aborted = true;
+                break;
+            }
+
             vector<PlacementLine> grown;
 
             for (PlacementLine &line : lines)
             {
+                // Only the line still under the guarantee ignores the clock,
+                // and only until it has produced a rail.
+                mustFinish = guarantee;
+
+                // Listing a line's candidates re-derives both groups of every
+                // open wish, so it is worth a check of its own.
+                if (outOfTime())
+                {
+                    aborted = true;
+                    break;
+                }
+
                 vector<Coord> candidates =
                     placementCandidates(line.board, wishes, active, line.paintLeft);
 
@@ -1295,12 +1368,27 @@ public:
                 if (candidates.empty())
                 {
                     if (!line.action.empty())
+                    {
                         finished.push_back(move(line.action));
+                        // Moved from, so the abort harvest below skips it.
+                        line.action.cells.clear();
+                    }
+                    // Still nothing to play, so the guarantee stays armed for
+                    // whichever line does manage to produce a rail.
                     continue;
                 }
 
                 for (const Coord &c : candidates)
                 {
+                    // One candidate is a board copy plus a full rescore, the
+                    // grain the whole planner is built out of: checking here
+                    // is what bounds the overrun.
+                    if (outOfTime())
+                    {
+                        aborted = true;
+                        break;
+                    }
+
                     PlacementLine child;
                     {
                         PROFILE(stateCopy);
@@ -1316,10 +1404,35 @@ public:
                     child.action.resultingGap = openGapTotal(child.board, wishes);
 
                     grown.push_back(move(child));
+
+                    // A rail is down: there is a move to play, so the clock
+                    // is back in charge for everything that follows.
+                    guarantee = false;
+                    mustFinish = false;
                 }
+
+                mustFinish = false;
+
+                if (aborted)
+                    break;
             }
 
             statesSeen += (int)grown.size();
+
+            if (aborted)
+            {
+                // Time ran out part-way through a round. Every line still
+                // alive is a legal turn already, and so is every child the
+                // round did manage to build, so both are kept instead of
+                // being thrown away; the final ranking below sorts them out.
+                for (PlacementLine &line : lines)
+                    if (!line.action.empty())
+                        finished.push_back(move(line.action));
+                for (PlacementLine &child : grown)
+                    finished.push_back(move(child.action));
+                break;
+            }
+
             if (grown.empty())
                 break;
 
@@ -1340,6 +1453,11 @@ public:
         if ((int)finished.size() > keep)
             finished.resize(keep);
 
+        mustFinish = false;
+
+        if (aborted)
+            stats.placementsTruncated++;
+
         return finished;
     }
 
@@ -1349,16 +1467,20 @@ public:
     // least one opponent rail, and — counting unique rails per player across
     // the active connections running through it — the opponent owns strictly
     // more than we do. Only the single best region is returned (-1 if none).
-    static int buildDisruptChoice(Map &board,
-                                  const vector<pair<int, int>> &wishes,
-                                  int selfId, int otherId)
+    int buildDisruptChoice(Map &board,
+                           const vector<pair<int, int>> &wishes,
+                           int selfId, int otherId) const
     {
         PROFILE(disruptChoice);
 
         // Collect the cells of every currently active connection once.
+        // Interruptible: a partial set just means fewer candidate regions.
         vector<vector<Coord>> connectionPaths;
         for (const auto &wish : wishes)
         {
+            if (outOfTime())
+                break;
+
             int a = wish.first, b = wish.second;
             if (!board.hasTown(a) || !board.hasTown(b))
                 continue;
@@ -1426,14 +1548,20 @@ public:
     // simulated turn and accumulated into the node, mirroring how the referee
     // awards points, so a state's banked income is a real running total
     // rather than a snapshot recomputed from the final board.
-    static void turnIncome(Map &board, const vector<pair<int, int>> &wishes,
-                           int selfId, int otherId, int &outSelf, int &outOther)
+    // Interruptible: an unmeasured wish pays nobody. That loses income on
+    // both sides of the same subtraction, so the comparison between the two
+    // players stays roughly fair even on a turn that ran out of clock.
+    void turnIncome(Map &board, const vector<pair<int, int>> &wishes,
+                    int selfId, int otherId, int &outSelf, int &outOther) const
     {
         outSelf = 0;
         outOther = 0;
 
         for (const auto &wish : wishes)
         {
+            if (outOfTime())
+                break;
+
             int a = wish.first, b = wish.second;
             if (!board.hasTown(a) || !board.hasTown(b))
                 continue;
@@ -1457,12 +1585,21 @@ public:
     // This is the only forward-looking term: the income above cannot see a
     // connection that does not exist yet, so without this the search has no
     // gradient to follow towards building one.
-    static int openGapTotal(const Map &board, const vector<pair<int, int>> &wishes)
+    // One wish costs two flood fills plus a cross product over the two groups
+    // they find, so on a board with many towns and large rail fields a single
+    // call is milliseconds, not microseconds. It is therefore interruptible:
+    // the wishes already measured stand and the rest are treated as closed,
+    // which understates the gap. That biases a score the search is about to
+    // stop trusting anyway, and is much cheaper than overrunning the turn.
+    int openGapTotal(const Map &board, const vector<pair<int, int>> &wishes) const
     {
         int gap = 0;
 
         for (const auto &wish : wishes)
         {
+            if (outOfTime())
+                break;
+
             int a = wish.first, b = wish.second;
             GroupLink link = closestGroupLink(board, a, b);
             // INT_MAX: a town has no rail group at all, nothing to measure.
@@ -1483,8 +1620,8 @@ public:
     // ranks states from different depths against each other when a depth is
     // cut short by the clock, and a raw cumulative total would make a deeper
     // state win on depth alone; a per-turn rate stays comparable.
-    static int evaluate(const Map &board, const vector<pair<int, int>> &wishes,
-                        int bankedSelf, int bankedOther, int turns)
+    int evaluate(const Map &board, const vector<pair<int, int>> &wishes,
+                 int bankedSelf, int bankedOther, int turns) const
     {
         PROFILE(evaluate);
 
@@ -1559,27 +1696,42 @@ public:
         outDisrupt = -1;
         stats.reset();
 
-        BeamNode root;
-        root.state = *startBoard;
-        root.active = startActive;
-        // Nothing simulated yet, so nothing banked: the root is judged on its
-        // open gaps alone.
-        root.score = evaluate(root.state, wishes, 0, 0, 0);
-
-        vector<BeamNode> beam{root};
-
+        // The deadline is set before anything else, because everything else
+        // -- the root's own scoring included -- now tests it. Leaving it at
+        // the previous turn's value would make the whole turn read as already
+        // out of time.
+        //
         // The beam deepens only while there is time left in the turn: on big
         // boards a full MAX_DEPTH sweep overruns the limit, so we keep the
         // best line found so far instead of forfeiting the turn. The first
         // turn gets the referee's larger allowance.
         int budgetMs = firstTurn ? FIRST_TURN_BUDGET_MS : TURN_BUDGET_MS;
-        // The deadline can only be tested between expansions, so the search
-        // always overruns it by whatever the expansion in flight still had to
-        // do. That was measured at ~3 ms here, so the target is pulled in by
-        // that much to make TURN_BUDGET_MS the bound actually observed.
+        // The deadline is tested down to the individual rail placement and to
+        // the individual wish, so the work still in flight when it fires is
+        // small -- but the turn also has to survive scoring, ranking and
+        // printing after the search returns. The target is pulled in by that
+        // much so TURN_BUDGET_MS is the bound actually observed.
         static const int IN_FLIGHT_MARGIN_MS = 3;
-        auto deadline = turnStart + std::chrono::milliseconds(budgetMs) -
-                        std::chrono::milliseconds(IN_FLIGHT_MARGIN_MS);
+        deadline = turnStart + std::chrono::milliseconds(budgetMs) -
+                   std::chrono::milliseconds(IN_FLIGHT_MARGIN_MS);
+
+        BeamNode root;
+        root.state = *startBoard;
+        root.active = startActive;
+        // Nothing simulated yet, so nothing banked: the root is judged on its
+        // open gaps alone. Scored with the clock ignored, because a root whose
+        // gaps went unmeasured would be a meaningless baseline for every child
+        // that gets compared against it.
+        mustFinish = true;
+        root.score = evaluate(root.state, wishes, 0, 0, 0);
+        mustFinish = false;
+
+        vector<BeamNode> beam{root};
+
+        // Whether any turn planning has run yet this turn. Until one has, the
+        // search has no move to fall back on, so the first one is allowed to
+        // ignore the clock.
+        bool anyPlanYet = false;
 
         // A depth no longer has to fit entirely in the remaining time: it is
         // always entered, and abandoned mid-way when the deadline hits. The
@@ -1592,7 +1744,7 @@ public:
 
         for (int depth = 0; depth < MAX_DEPTH; depth++)
         {
-            if (std::chrono::steady_clock::now() >= deadline)
+            if (outOfTime())
                 break;
 
             vector<BeamNode> nextBeam;
@@ -1600,7 +1752,7 @@ public:
 
             for (BeamNode &node : beam)
             {
-                if (std::chrono::steady_clock::now() >= deadline)
+                if (outOfTime())
                 {
                     stats.truncatedByTime++;
                     depthComplete = false;
@@ -1627,16 +1779,22 @@ public:
                 int keep = (MAX_BRANCHING > 0)
                                ? min((int)PLACEMENT_BEAM_WIDTH, MAX_BRANCHING)
                                : (int)PLACEMENT_BEAM_WIDTH;
+                // The first depth-0 planning of the turn is the one whose
+                // result we fall back on if everything after it is cut short,
+                // so it alone may overrun rather than hand back nothing. Once
+                // it has run, the rest of the beam is bounded normally.
+                bool needMove = (depth == 0 && !anyPlanYet);
                 vector<ActionSet> myTurns =
                     planTurnPlacements(node.state, wishes, node.active, myId,
-                                       keep, placementStates);
+                                       keep, placementStates, needMove);
+                anyPlanYet = true;
                 stats.actionsCreated[depth] += (int)myTurns.size();
                 stats.placementStates[depth] += placementStates;
 
-                // Planning both turns is a sizeable chunk of a depth, and the
-                // deadline cannot be tested inside it: bail out here rather
-                // than starting to expand what it produced.
-                if (std::chrono::steady_clock::now() >= deadline)
+                // The planning above stops on the deadline by itself, but it
+                // can stop having produced next to nothing: bail out here
+                // rather than expanding a turn it never got to think about.
+                if (outOfTime())
                 {
                     stats.truncatedByTime++;
                     depthComplete = false;
@@ -1653,7 +1811,7 @@ public:
                 {
                     // Expanding a turn is the expensive step, so the budget
                     // is checked here too rather than once per node.
-                    if (std::chrono::steady_clock::now() >= deadline)
+                    if (outOfTime())
                     {
                         stats.truncatedByTime++;
                         depthComplete = false;

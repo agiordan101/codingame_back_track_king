@@ -121,9 +121,8 @@ Each time we want a A* distance, verify if a cache entry exist :
 
 ## Next steps
 
-- Comment choisir les 3 rails ? L'un après l'autre ?
-- Comment inclure des cases potentielle qui permettraient de faire des chemins plus court ?
-- Créer les actions avec tous les groupes de rails >= 3 plutot que ceux directement lié aux towns ?
+- Lister les endroits ou on fait des floodfill/a* et mettre en cache tout ça
+- Eviter les cross-products
 - Créer une heuristic
 - Ne pas créer des moves uniquement sur les groupe de rails des villes pas encore lié :
     - Creer des moves sur les fin de chemin vers le rail le plus proche qui n'est pas du même groupe 
