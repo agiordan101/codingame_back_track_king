@@ -71,10 +71,10 @@ public:
 DECLARE_PROFILE(mainLoopturn)
 DECLARE_PROFILE(beamSearch)
 DECLARE_PROFILE(railChoices)
+DECLARE_PROFILE(planActionSet)
 DECLARE_PROFILE(disruptChoice)
 DECLARE_PROFILE(simulateTurn)
 DECLARE_PROFILE(evaluate)
-DECLARE_PROFILE(planRails)
 DECLARE_PROFILE(connectionPath)
 DECLARE_PROFILE(railGroupOf)
 DECLARE_PROFILE(stateCopy)
@@ -82,12 +82,12 @@ DECLARE_PROFILE(stateCopy)
 // ====================
 // CONSTANTS
 
-static const int BEAM_WIDTH = 20;
+static const int BEAM_WIDTH = 10;
 // Upper bound on how many action sets one state expands into. It exists for
 // responsiveness, not for pruning quality: the deadline is only tested
 // between choices, so an uncapped node (~70 choices here) runs ~90 ms past
 // the budget before the search can react. Set to 0 to disable.
-static const int MAX_BRANCHING = 0;
+static const int MAX_BRANCHING = 20;
 static const int MAX_DEPTH = 10;
 static const int PAINT_PER_TURN = 3;
 
@@ -922,13 +922,33 @@ public:
 // CHOICES
 
 // A rail placement choice: build from src towards dst.
-class RailChoice
+// The two cells that would join a wish's two rail groups, and how far apart
+// they are. Not an action: it says where the gap is, and action sets are
+// generated to close it.
+class GroupLink
 {
 public:
     Coord src, dst;
     int distance;
-    RailChoice(Coord s = {}, Coord d = {}, int dist = INT_MAX)
+    GroupLink(Coord s = {}, Coord d = {}, int dist = INT_MAX)
         : src(s), dst(d), distance(dist) {}
+};
+
+// One turn's worth of building: the cells to lay rail on this turn. A turn
+// buys PAINT_PER_TURN paint and each cell costs its terrain, so a set holds
+// at most PAINT_PER_TURN cells and often fewer — a single mountain (cost 3)
+// spends the whole turn.
+class ActionSet
+{
+public:
+    vector<Coord> cells;
+    // Paint spent by `cells`, i.e. the sum of their terrain costs.
+    int cost = 0;
+    // Distance still separating the two groups once these cells are laid.
+    // Used to rank sets when the branching cap has to drop some.
+    int resultingGap = INT_MAX;
+
+    bool empty() const { return cells.empty(); }
 };
 
 // ====================
@@ -946,7 +966,7 @@ public:
     int totalStates;
 
     // Per depth:
-    //  - actionsCreated : action sets buildRailChoices() proposed. Every
+    //  - actionsCreated : action sets buildActionSets() proposed. Every
     //                     one of them is expanded.
     //  - statesPerDepth : child states produced, before the Bwidth cut.
     vector<int> actionsCreated;
@@ -1020,15 +1040,14 @@ public:
     // used to keep lines of different depths comparable.
     int bankedSelf, bankedOther;
     int turns;
-    // The rail choice played at the root of this line, i.e. the move we
-    // would actually output this turn.
-    bool hasRootChoice;
-    RailChoice rootChoice;
+    // The action set played at the root of this line, i.e. the rails we
+    // would actually place this turn.
+    ActionSet rootAction;
     int rootDisrupt;
 
     BeamNode()
         : score(0), bankedSelf(0), bankedOther(0), turns(0),
-          hasRootChoice(false), rootDisrupt(-1) {}
+          rootDisrupt(-1) {}
 };
 
 // ====================
@@ -1072,12 +1091,12 @@ public:
     // ---- rail group linking ----
 
     // Cheapest (Manhattan) pair of cells across the two rail groups attached
-    // to towns `a` and `b`. Returns a RailChoice with distance INT_MAX when
+    // to towns `a` and `b`. Returns a GroupLink with distance INT_MAX when
     // either town is missing or has no group, and distance 0 when the two
     // groups share a cell, i.e. the towns are already linked.
-    static RailChoice closestGroupLink(const Map &board, int a, int b)
+    static GroupLink closestGroupLink(const Map &board, int a, int b)
     {
-        RailChoice best;
+        GroupLink best;
         if (!board.hasTown(a) || !board.hasTown(b))
             return best;
 
@@ -1094,7 +1113,7 @@ public:
             cellsA.insert({ca.x, ca.y});
         for (const Coord &cb : groupB)
             if (cellsA.count({cb.x, cb.y}))
-                return RailChoice(cb, cb, 0);
+                return GroupLink(cb, cb, 0);
 
         // Cross-product of both groups: keep the shortest link.
         for (const Coord &ca : groupA)
@@ -1103,41 +1122,206 @@ public:
             {
                 int d = abs(ca.x - cb.x) + abs(ca.y - cb.y);
                 if (d < best.distance)
-                    best = RailChoice(ca, cb, d);
+                    best = GroupLink(ca, cb, d);
             }
         }
         return best;
     }
 
-    // ---- "Rail placement choice"s creation ----
+    // ---- action set creation ----
 
-    // For every desired connection not yet built, grow the rail group already
-    // attached to each of the two towns, then take the cheapest (Manhattan)
-    // pair of cells across the two groups. That pair is the choice.
-    static vector<RailChoice> buildRailChoices(const Map &board,
-                                               const vector<pair<int, int>> &wishes,
-                                               const map<pair<int, int>, bool> &active)
+    // Every cell already reachable by the two groups of one wish, i.e. the
+    // frontier an action set grows from. `src`/`dst` are the closest pair,
+    // so growing from either end is what shortens the gap.
+    static bool linkEndpoints(const Map &board, int a, int b, GroupLink &out)
+    {
+        out = closestGroupLink(board, a, b);
+        // INT_MAX: nothing measurable. 0: already joined, nothing to build.
+        return out.distance != INT_MAX && out.distance > 0;
+    }
+
+
+    // The one action set that advances a link: walk from its source towards
+    // its destination, spending the turn's paint. At each step the neighbour
+    // with the smallest A* distance to the destination wins, ties broken
+    // NORTH/EAST/SOUTH/WEST. The walk stops when the paint runs out, the far
+    // group is reached, or nothing useful is adjacent.
+    //
+    // The cells are returned rather than written, so both players' rails can
+    // be applied simultaneously (neutral-owner rule).
+    static ActionSet planActionSet(const Map &board, const GroupLink &link)
+    {
+        PROFILE(planActionSet);
+        ActionSet action;
+        if (link.distance == INT_MAX)
+            return action;
+
+        // Cells claimed so far this turn, so the walk does not reuse one.
+        set<pair<int, int>> claimed;
+
+        // Distance from every cell to the destination, from the shared lookup
+        // table. The field is built over terrain and ink only — rails laid
+        // during the search are deliberately excluded so one field stays
+        // valid for every beam node; the walk below still refuses occupied
+        // cells when it picks where to build.
+        const int W = board.width(), H = board.height();
+        PathTable *table = board.paths();
+        PathTable::DistanceField localField;
+        const PathTable::DistanceField *field = nullptr;
+
+        if (table)
+            field = table->findField(link.dst);
+
+        if (!field)
+        {
+            PathTable::DistanceField built;
+            built.dist.assign(W * H, INT_MAX);
+            set<int> touched;
+
+            priority_queue<tuple<int, int, int>, vector<tuple<int, int, int>>, greater<>> pq;
+            built.dist[link.dst.y * W + link.dst.x] = 0;
+            pq.push({0, link.dst.x, link.dst.y});
+
+            while (!pq.empty())
+            {
+                auto [d, x, y] = pq.top();
+                pq.pop();
+                if (d > built.dist[y * W + x])
+                    continue;
+                touched.insert(board.tileRegion(x, y));
+
+                for (int k = 0; k < 4; k++)
+                {
+                    int nx = x + DIR_X[k], ny = y + DIR_Y[k];
+                    if (!board.inBounds(nx, ny))
+                        continue;
+                    // Terrain-only traversability: a cell is usable unless it
+                    // is a town, inked, or impassable terrain.
+                    if (board.isTownCell(nx, ny) || board.isInked(nx, ny))
+                        continue;
+                    int cost = board.railCost(nx, ny);
+                    if (cost == INT_MAX)
+                        continue;
+
+                    int nd = d + cost;
+                    if (nd < built.dist[ny * W + nx])
+                    {
+                        built.dist[ny * W + nx] = nd;
+                        pq.push({nd, nx, ny});
+                    }
+                }
+            }
+
+            built.regions.assign(touched.begin(), touched.end());
+
+            // Keep the freshly built field locally in every case, then try to
+            // cache a copy. A field spanning an inked region is refused by the
+            // table, so the local copy is what this call uses.
+            localField = move(built);
+            field = &localField;
+
+            if (table)
+            {
+                const PathTable::DistanceField *cached =
+                    table->insertField(link.dst, localField);
+                if (cached)
+                    field = cached;
+            }
+        }
+
+        const vector<int> &distToDst = field->dist;
+
+        Coord cur = link.src;
+        int paint = PAINT_PER_TURN;
+
+        while (paint > 0)
+        {
+            int bestK = -1;
+            int bestDist = INT_MAX;
+
+            for (int k = 0; k < 4; k++)
+            {
+                int nx = cur.x + DIR_X[k], ny = cur.y + DIR_Y[k];
+                if (!board.inBounds(nx, ny))
+                    continue;
+                if (!board.canPlaceRail(nx, ny) || claimed.count({nx, ny}))
+                    continue;
+                if (board.railCost(nx, ny) > paint)
+                    continue; // not enough paint left for this terrain
+
+                int d = distToDst[ny * W + nx];
+                if (d == INT_MAX)
+                    continue;
+                // Strictly-less keeps the earlier (higher priority) direction.
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestK = k;
+                }
+            }
+
+            if (bestK == -1)
+                break; // nowhere useful left to build
+
+            Coord next(cur.x + DIR_X[bestK], cur.y + DIR_Y[bestK]);
+            int cost = board.railCost(next.x, next.y);
+            paint -= cost;
+            claimed.insert({next.x, next.y});
+            action.cells.push_back(next);
+            action.cost += cost;
+
+            // Reached the far group: the connection is joined.
+            if (next == link.dst)
+                break;
+            cur = next;
+        }
+
+        return action;
+    }
+
+    // One action set per open wish: the cells that wish would have us paint
+    // this turn. An action is no longer "link these two points and replay a
+    // walk later" — it is the concrete set of cells, decided here and applied
+    // as-is, so the board the search scored is the one that gets played.
+    //
+    // Each wish yields exactly one set: the walk towards the other group is
+    // deterministic, so the beam's choice is which wish to advance, not how
+    // to route towards it.
+    static vector<ActionSet> buildActionSets(const Map &board,
+                                             const vector<pair<int, int>> &wishes,
+                                             const map<pair<int, int>, bool> &active)
     {
         PROFILE(railChoices);
 
-        vector<RailChoice> choices;
+        vector<ActionSet> sets;
+        // One wish is listed from both towns, so the same pair arrives twice;
+        // planning it once is enough.
+        set<pair<int, int>> done;
 
         for (const auto &wish : wishes)
         {
             int a = wish.first, b = wish.second;
-            // Already built: nothing to place for this wish.
             if (active.count({a, b}) || active.count({b, a}))
                 continue;
+            auto key = a < b ? make_pair(a, b) : make_pair(b, a);
+            if (!done.insert(key).second)
+                continue;
 
-            RailChoice best = closestGroupLink(board, a, b);
+            GroupLink link;
+            if (!linkEndpoints(board, a, b, link))
+                continue;
 
-            // distance 0 means the groups already touch: the connection is
-            // effectively built, nothing to place.
-            if (best.distance != INT_MAX && best.distance > 0)
-                choices.push_back(best);
+            ActionSet action = planActionSet(board, link);
+            if (action.empty())
+                continue;
+
+            // How much of the gap this set leaves behind, used to rank sets
+            // when the branching cap has to drop some.
+            action.resultingGap = max(0, link.distance - (int)action.cells.size());
+            sets.push_back(move(action));
         }
 
-        return choices;
+        return sets;
     }
 
     // ---- "Disrupt choice" creation ----
@@ -1211,142 +1395,6 @@ public:
         return best;
     }
 
-    // ---- "Rail placement choice" application ----
-
-    // Walks from the choice's source towards its destination, spending the
-    // turn's paint. At each step the neighbour with the smallest A* distance
-    // to the destination wins, ties broken NORTH/EAST/SOUTH/WEST.
-    //
-    // The cells to fill are returned rather than written, so both players'
-    // rails can be applied simultaneously (neutral-owner rule).
-    static vector<Coord> planRailPlacements(const Map &board, const RailChoice &choice)
-    {
-        PROFILE(planRails);
-        vector<Coord> placements;
-        if (choice.distance == INT_MAX)
-            return placements;
-
-        // Cells claimed so far this turn, so the walk does not reuse one.
-        set<pair<int, int>> claimed;
-
-        // Distance from every cell to the destination, from the shared lookup
-        // table. The field is built over terrain and ink only — rails laid
-        // during the search are deliberately excluded so one field stays
-        // valid for every beam node; the walk below still refuses occupied
-        // cells when it picks where to build.
-        const int W = board.width(), H = board.height();
-        PathTable *table = board.paths();
-        PathTable::DistanceField localField;
-        const PathTable::DistanceField *field = nullptr;
-
-        if (table)
-            field = table->findField(choice.dst);
-
-        if (!field)
-        {
-            PathTable::DistanceField built;
-            built.dist.assign(W * H, INT_MAX);
-            set<int> touched;
-
-            priority_queue<tuple<int, int, int>, vector<tuple<int, int, int>>, greater<>> pq;
-            built.dist[choice.dst.y * W + choice.dst.x] = 0;
-            pq.push({0, choice.dst.x, choice.dst.y});
-
-            while (!pq.empty())
-            {
-                auto [d, x, y] = pq.top();
-                pq.pop();
-                if (d > built.dist[y * W + x])
-                    continue;
-                touched.insert(board.tileRegion(x, y));
-
-                for (int k = 0; k < 4; k++)
-                {
-                    int nx = x + DIR_X[k], ny = y + DIR_Y[k];
-                    if (!board.inBounds(nx, ny))
-                        continue;
-                    // Terrain-only traversability: a cell is usable unless it
-                    // is a town, inked, or impassable terrain.
-                    if (board.isTownCell(nx, ny) || board.isInked(nx, ny))
-                        continue;
-                    int cost = board.railCost(nx, ny);
-                    if (cost == INT_MAX)
-                        continue;
-
-                    int nd = d + cost;
-                    if (nd < built.dist[ny * W + nx])
-                    {
-                        built.dist[ny * W + nx] = nd;
-                        pq.push({nd, nx, ny});
-                    }
-                }
-            }
-
-            built.regions.assign(touched.begin(), touched.end());
-
-            // Keep the freshly built field locally in every case, then try to
-            // cache a copy. A field spanning an inked region is refused by the
-            // table, so the local copy is what this call uses.
-            localField = move(built);
-            field = &localField;
-
-            if (table)
-            {
-                const PathTable::DistanceField *cached =
-                    table->insertField(choice.dst, localField);
-                if (cached)
-                    field = cached;
-            }
-        }
-
-        const vector<int> &distToDst = field->dist;
-
-        Coord cur = choice.src;
-        int paint = PAINT_PER_TURN;
-
-        while (paint > 0)
-        {
-            int bestK = -1;
-            int bestDist = INT_MAX;
-
-            for (int k = 0; k < 4; k++)
-            {
-                int nx = cur.x + DIR_X[k], ny = cur.y + DIR_Y[k];
-                if (!board.inBounds(nx, ny))
-                    continue;
-                if (!board.canPlaceRail(nx, ny) || claimed.count({nx, ny}))
-                    continue;
-                if (board.railCost(nx, ny) > paint)
-                    continue; // not enough paint left for this terrain
-
-                int d = distToDst[ny * W + nx];
-                if (d == INT_MAX)
-                    continue;
-                // Strictly-less keeps the earlier (higher priority) direction.
-                if (d < bestDist)
-                {
-                    bestDist = d;
-                    bestK = k;
-                }
-            }
-
-            if (bestK == -1)
-                break; // nowhere useful left to build
-
-            Coord next(cur.x + DIR_X[bestK], cur.y + DIR_Y[bestK]);
-            paint -= board.railCost(next.x, next.y);
-            claimed.insert({next.x, next.y});
-            placements.push_back(next);
-
-            // Reached the far group: the connection is joined.
-            if (next == choice.dst)
-                break;
-            cur = next;
-        }
-
-        return placements;
-    }
-
     // ---- heuristic ----
 
     // Weight of one cell of remaining gap on an unbuilt wish. A gap cell is
@@ -1397,7 +1445,7 @@ public:
         for (const auto &wish : wishes)
         {
             int a = wish.first, b = wish.second;
-            RailChoice link = closestGroupLink(board, a, b);
+            GroupLink link = closestGroupLink(board, a, b);
             // INT_MAX: a town has no rail group at all, nothing to measure.
             // 0: the groups already touch, so this wish is not open.
             if (link.distance != INT_MAX)
@@ -1474,11 +1522,11 @@ public:
     }
 
     // Runs the beam and returns the move to play this turn.
-    void run(bool &outHasRail, RailChoice &outRail, int &outDisrupt)
+    void run(ActionSet &outAction, int &outDisrupt)
     {
         PROFILE(beamSearch);
 
-        outHasRail = false;
+        outAction = ActionSet();
         outDisrupt = -1;
         stats.reset();
 
@@ -1533,28 +1581,28 @@ public:
                 // 2. Copy current_state in turn_state (node.state is turn_state).
                 // 3. Generate rail choices.
                 //
-                // buildRailChoices + the two disrupt scans + the foe's rail
-                // plan all run before the first choice is expanded, so a node
-                // entered near the deadline overshoots it by that setup cost
-                // alone. Checked again after the setup, below.
-                vector<RailChoice> railChoices =
-                    buildRailChoices(node.state, wishes, node.active);
-                stats.actionsCreated[depth] += (int)railChoices.size();
+                // buildActionSets + the two disrupt scans + the foe's reply
+                // all run before the first set is expanded, so a node entered
+                // near the deadline overshoots it by that setup cost alone.
+                // Checked again after the setup, below.
+                vector<ActionSet> actionSets =
+                    buildActionSets(node.state, wishes, node.active);
+                stats.actionsCreated[depth] += (int)actionSets.size();
 
                 // 4. Generate both players' best disrupt choices.
                 int myDisrupt = buildDisruptChoice(node.state, wishes, myId, foeId);
                 int foeDisrupt = buildDisruptChoice(node.state, wishes, foeId, myId);
 
-                // The opponent replies with their own best (shortest) rail
-                // choice, held fixed across our alternatives.
+                // The opponent replies with the set that closes the most
+                // ground, held fixed across our alternatives.
                 vector<Coord> foeRails;
-                if (!railChoices.empty())
+                if (!actionSets.empty())
                 {
-                    const RailChoice *foeBest = &railChoices[0];
-                    for (const RailChoice &rc : railChoices)
-                        if (rc.distance < foeBest->distance)
-                            foeBest = &rc;
-                    foeRails = planRailPlacements(node.state, *foeBest);
+                    const ActionSet *foeBest = &actionSets[0];
+                    for (const ActionSet &as : actionSets)
+                        if (as.resultingGap < foeBest->resultingGap)
+                            foeBest = &as;
+                    foeRails = foeBest->cells;
                 }
 
                 // The per-node setup above is itself a sizeable chunk of a
@@ -1566,15 +1614,14 @@ public:
                     break;
                 }
 
-                if (railChoices.empty())
+                if (actionSets.empty())
                 {
                     // No rail to build: still simulate disrupts so the line
                     // keeps evolving.
                     BeamNode child;
                     child.state = node.state;
                     child.active = node.active;
-                    child.hasRootChoice = node.hasRootChoice;
-                    child.rootChoice = node.rootChoice;
+                    child.rootAction = node.rootAction;
                     child.rootDisrupt = (depth == 0) ? myDisrupt : node.rootDisrupt;
 
                     simulateTurn(child, node, wishes, {}, foeRails,
@@ -1584,17 +1631,25 @@ public:
                 }
 
                 // 7. Iterate over rail choices.
-                if (MAX_BRANCHING > 0 && (int)railChoices.size() > MAX_BRANCHING)
+                if (MAX_BRANCHING > 0 && (int)actionSets.size() > MAX_BRANCHING)
                 {
-                    partial_sort(railChoices.begin(),
-                                 railChoices.begin() + MAX_BRANCHING,
-                                 railChoices.end(),
-                                 [](const RailChoice &a, const RailChoice &b)
-                                 { return a.distance < b.distance; });
-                    railChoices.resize(MAX_BRANCHING);
+                    partial_sort(actionSets.begin(),
+                                 actionSets.begin() + MAX_BRANCHING,
+                                 actionSets.end(),
+                                 [](const ActionSet &a, const ActionSet &b)
+                                 {
+                                     // Closing the gap first; among sets that
+                                     // close it equally, the one that lays
+                                     // more paint, since unspent paint is
+                                     // simply lost at the end of the turn.
+                                     if (a.resultingGap != b.resultingGap)
+                                         return a.resultingGap < b.resultingGap;
+                                     return a.cost > b.cost;
+                                 });
+                    actionSets.resize(MAX_BRANCHING);
                 }
 
-                for (const RailChoice &choice : railChoices)
+                for (const ActionSet &action : actionSets)
                 {
                     // Expanding a choice is the expensive step, so the budget
                     // is checked here too rather than once per node.
@@ -1614,19 +1669,18 @@ public:
 
                     if (depth == 0)
                     {
-                        child.hasRootChoice = true;
-                        child.rootChoice = choice;
+                        child.rootAction = action;
                         child.rootDisrupt = myDisrupt;
                     }
                     else
                     {
-                        child.hasRootChoice = node.hasRootChoice;
-                        child.rootChoice = node.rootChoice;
+                        child.rootAction = node.rootAction;
                         child.rootDisrupt = node.rootDisrupt;
                     }
 
-                    vector<Coord> myRails = planRailPlacements(child.state, choice);
-                    simulateTurn(child, node, wishes, myRails, foeRails,
+                    // The set already names its cells: no replanning, so the
+                    // board the search scored is the one that gets played.
+                    simulateTurn(child, node, wishes, action.cells, foeRails,
                                  myDisrupt, foeDisrupt, myId, foeId);
 
                     nextBeam.push_back(move(child));
@@ -1678,8 +1732,7 @@ public:
         if (!beam.empty())
         {
             const BeamNode &best = beam.front();
-            outHasRail = best.hasRootChoice;
-            outRail = best.rootChoice;
+            outAction = best.rootAction;
             outDisrupt = best.rootDisrupt;
         }
     }
@@ -1741,29 +1794,22 @@ public:
     {
         pathTable.resetStats();
 
-        bool hasRail = false;
-        RailChoice rail;
+        ActionSet action;
         int disrupt = -1;
 
         beam.setup(myId, foeId, gameMap, activeConnections, wishes,
                    turnStart, firstTurn);
-        beam.run(hasRail, rail, disrupt);
+        beam.run(action, disrupt);
 
         vector<string> actions;
 
         // The engine resolves every PLACE_TRACKS before any DISRUPT, so the
         // commands are emitted in that same order.
-        int placed = 0;
-        if (hasRail)
-        {
-            // Turn the chosen link into concrete rail placements for this turn.
-            vector<Coord> placements = BeamSearch::planRailPlacements(gameMap, rail);
-            for (const Coord &c : placements)
-            {
-                actions.push_back("PLACE_TRACKS " + to_string(c.x) + " " + to_string(c.y));
-            }
-            placed = (int)placements.size();
-        }
+        // The search already decided the exact cells, so they are emitted
+        // verbatim rather than replanned from a pair of endpoints.
+        for (const Coord &c : action.cells)
+            actions.push_back("PLACE_TRACKS " + to_string(c.x) + " " + to_string(c.y));
+        int placed = (int)action.cells.size();
 
         if (disrupt != -1)
             actions.push_back("DISRUPT " + to_string(disrupt));
@@ -1822,10 +1868,10 @@ int main()
         PRINT_PROFILE(mainLoopturn);
         PRINT_PROFILE(beamSearch);
         PRINT_PROFILE(railChoices);
+        PRINT_PROFILE(planActionSet);
         PRINT_PROFILE(disruptChoice);
         PRINT_PROFILE(simulateTurn);
         PRINT_PROFILE(evaluate);
-        PRINT_PROFILE(planRails);
         PRINT_PROFILE(connectionPath);
         PRINT_PROFILE(railGroupOf);
         PRINT_PROFILE(stateCopy);
