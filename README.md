@@ -40,6 +40,15 @@ tour coûte ~100 µs au lieu des 30 ms du beam.
 5. **Rails** : jusqu'à trois tours de boucle, chacun un balayage linéaire qui
    garde la meilleure case jouable et abordable. Le deuxième rail est donc
    choisi en sachant le premier.
+6. **Diffusion** (`diffuseValues`), seulement quand le balayage ne trouve plus
+   rien à poser alors qu'il reste de la peinture : chaque case encore à zéro
+   prend **la moitié de chaque voisine valuée**, sommée — une case entre deux
+   voisines valuées reçoit donc les deux moitiés. La passe lit un instantané
+   et écrit dans `value`, donc une case remplie par la passe ne nourrit pas la
+   suivante *dans* la même passe : un appel = un anneau. On rappelle jusqu'à
+   trouver une case, et la division par deux tue le front dès qu'il passe sous
+   2, donc la boucle se termine seule. L'encre et l'infranchissable ne
+   conduisent rien : aucun rail ne peut y vivre.
 
 Le choix des rails se fait sur une clé 64 bits construite en place
 (`value << 23 | touche-le-réseau << 22 | (3-coût) << 20 | (N-1-idx)`), donc la
@@ -55,6 +64,11 @@ ses cases à l'identique. Les départages, dans l'ordre :
 2. **terrain le moins cher** — à valeur égale, une plaine laisse deux rails de
    plus dans le tour qu'une montagne.
 3. **ordre de balayage**, pour rester déterministe.
+
+La diffusion est ce qui remplit la fin de partie. Les plus courts chemins sont
+bâtis bien avant la fin du temps : sans elle, sur une partie gagnée 5116-1575,
+**65 tours sur 100 étaient des `WAIT`** et le bot posait 86 rails. Avec, zéro
+`WAIT` et 190 rails, pour ~36 µs par tour.
 
 ### Critiques de l'algorithme
 
@@ -224,6 +238,15 @@ distance totale.
   faire plein de liaisons rapidement. Trop lent.
 
 ## Versions
+
+### v3.1
+
+Diffusion des valeurs quand le tour ne peut plus rien poser : les cases à zéro
+prennent la moitié de chaque voisine valuée. 65 tours `WAIT` sur 100 → 0, et
+86 rails posés → 190, pour ~36 µs par tour.
+
+Battle locale contre v3.0 (119 parties valides, positions échangées) :
+**109 V – 0 D – 10 nulles**. v3.0 ne gagne aucune partie.
 
 ### v3.0
 
