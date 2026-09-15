@@ -33,6 +33,12 @@ tour coûte ~100 µs au lieu des 30 ms du beam.
 3. **DISRUPT** : un balayage linéaire somme, par région, `+value` sous un rail
    adverse et `-value` sous un des miens. La meilleure région non encrée et
    sans ville est la cible, ou aucune si le meilleur score est ≤ 0.
+   Le score se lit sur **une copie diffusée** (`disruptValue`), jamais sur
+   `value`. Le couloir fait une case de large et est arbitraire parmi les
+   chemins de même longueur : l'adversaire construit *à côté*, pas dessus, et
+   pèse donc zéro sur la carte brute. Un anneau de diffusion est ce qui fait
+   compter ses rails. La copie est ce qui garde ça hors du classement des
+   rails — voir plus bas.
 4. `value *= (INK_SCALE - instabilité)` par région. La division par
    `INK_SCALE` de la formule `(5 - inkLevel) / 5` n'est jamais faite : elle est
    la même pour toutes les cases, donc la supprimer laisse le classement
@@ -64,6 +70,14 @@ ses cases à l'identique. Les départages, dans l'ordre :
 2. **terrain le moins cher** — à valeur égale, une plaine laisse deux rails de
    plus dans le tour qu'une montagne.
 3. **ordre de balayage**, pour rester déterministe.
+
+**Ne jamais diffuser la carte que les rails classent.** Essayé en v3.2 : une
+passe inconditionnelle sur `value` juste après `buildValueMap`. Le halo remonte
+une montagne collée au couloir au-dessus d'une plaine plus loin sur ce même
+couloir, et comme `bestCell` classe sur la valeur brute, **58 tours sur 100
+passaient les 3 peintures dans une seule montagne** (tour 5 : une case à 540
+pour 3 peintures, là où trois plaines valaient 1190). Résultat : 4 V – 116 D
+contre v3.1. La diffusion pour le DISRUPT doit donc se faire sur une copie.
 
 La diffusion est ce qui remplit la fin de partie. Les plus courts chemins sont
 bâtis bien avant la fin du temps : sans elle, sur une partie gagnée 5116-1575,
@@ -238,6 +252,16 @@ distance totale.
   faire plein de liaisons rapidement. Trop lent.
 
 ## Versions
+
+### v3.3
+
+Diffuse la valeurs des cases seulement pour la selection du DISRUPT.
+Battle locale contre v3.1 (120 parties, positions échangées) : **118 V – 2 D**.
+
+### v3.2 — abandonnée
+
+Diffuse la valeurs des cases tout le temps.
+Problème : Les cases "évité" comme les montagne ayant 3 voisins héritent de plusieurs cases voisines et biaise les stats.
 
 ### v3.1
 
