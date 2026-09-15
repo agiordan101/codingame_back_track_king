@@ -25,8 +25,8 @@ tour coûte ~100 µs au lieu des 30 ms du beam.
 **Chaque tour** (`Planner::plan`)
 
 1. `value = baseValue` (une copie mémoire, même taille, pas de réallocation).
-2. Pour chaque wish, A* sur le terrain (encre infranchissable) entre les deux
-   villes, *active ou non*. Chaque case du chemin reçoit `W+H-coût`, donc les
+2. Pour chaque wish, A* sur le terrain (encre infranchissable) **de la ville
+   demandeuse vers la ville souhaitée**, *active ou non*. Chaque case du chemin reçoit `W+H-coût`, donc les
    liaisons courtes — les seules qu'un tour peut finir — pèsent le plus. Le
    chemin n'est jamais stocké : on remonte la chaîne de parents depuis la
    destination en ajoutant au passage.
@@ -59,6 +59,18 @@ tour coûte ~100 µs au lieu des 30 ms du beam.
 Le choix des rails se fait sur une clé 64 bits construite en place
 (`value << 23 | touche-le-réseau << 22 | (3-coût) << 20 | (N-1-idx)`), donc la
 comparaison du balayage est un seul entier.
+
+**Le sens du parcours compte.** L'A* départage ses égalités dans l'ordre
+NORTH, EAST, SOUTH, WEST (`DIR_X`/`DIR_Y`), en marchant *depuis la source* :
+la relaxation n'écrase un parent que sur une amélioration stricte
+(`ng >= gScore[nIdx]` saute), donc la première direction à atteindre une case
+au coût optimal la garde. Partir de B au lieu de A donne donc un autre couloir
+partout où plusieurs plus courts chemins existent — mesuré à **3,8 % des
+paires** sur terrain varié (0 % sur plaine uniforme, où le couloir est
+symétrique). D'où l'orientation conservée telle que l'arbitre l'annonce :
+`readTowns` émet `(ville demandeuse, ville voulue)`, et `init` ne trie plus la
+paire par id. Aucun wish n'est déclaré par ses deux villes — vérifié sur le
+plateau : 13 déclarations, 13 paires uniques, 0 mutuelle.
 
 **L'égalité est le cas normal**, pas l'exception : un chemin récompense toutes
 ses cases à l'identique. Les départages, dans l'ordre :
@@ -209,6 +221,11 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 - Simuler le tour de l'adversaire avec le même planner (il est assez rapide
   pour tourner deux fois) et éviter les cases qu'il va prendre.
 
+- Use partOfActiveConnections:
+  Une chaîne de paires townId séparées par des virgules indiquant que cette case fait partie d’une connexion active entre ces deux villes.
+  ex. " 1-2,1-3,4-7 ": la case fait partie du chemin le plus court entre les villes 1 & 2, villes 1 & 3, et villes 4 & 7.
+  " x " si cette case ne fait partie d’aucune connexion active.
+
 ## Historique — BEAM search (v2.x)
 
 Le code de ces versions est dans `backtrackking_v2.*.cpp`.
@@ -252,6 +269,12 @@ distance totale.
   faire plein de liaisons rapidement. Trop lent.
 
 ## Versions
+
+### v3.4
+
+L'A* part de la ville demandeuse, et non de celle au plus petit id. Le tri par
+id dans `init` annulait le départage NESW sur ~3,8 % des paires ; il ne
+dédupliquait rien, aucun wish n'étant déclaré deux fois.
 
 ### v3.3
 
