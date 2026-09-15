@@ -212,8 +212,6 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
-- Sac à dos sur les 3 points de peinture plutôt qu'un greedy par valeur brute
-  (voir les critiques ci-dessus).
 - Couloir de plus courts chemins plutôt qu'un seul tracé, par double A*.
 - A* à coût 0 sur les rails existants, pour que la récompense mesure le
   travail restant et non la distance théorique.
@@ -225,6 +223,10 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
   Une chaîne de paires townId séparées par des virgules indiquant que cette case fait partie d’une connexion active entre ces deux villes.
   ex. " 1-2,1-3,4-7 ": la case fait partie du chemin le plus court entre les villes 1 & 2, villes 1 & 3, et villes 4 & 7.
   " x " si cette case ne fait partie d’aucune connexion active.
+
+## Idées pour le prochain algorithm
+
+Lorsqu'on mettra un beam search par dessus, on pourrait faire des depth entre les tours pour choisir quelle région à disrupt parmis les 3 meilleurs.
 
 ## Historique — BEAM search (v2.x)
 

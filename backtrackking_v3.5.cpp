@@ -1,4 +1,4 @@
-// v3.5
+// v3.4
 
 // Greedy one-turn planner. No search, no lookahead: every turn the board is
 // scored once, cell by cell, and the rails go on the best cells the paint can
