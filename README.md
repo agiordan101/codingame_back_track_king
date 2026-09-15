@@ -212,9 +212,6 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
-- Couloir de plus courts chemins plutôt qu'un seul tracé, par double A*.
-- A* à coût 0 sur les rails existants, pour que la récompense mesure le
-  travail restant et non la distance théorique.
 - Pondérer le score de DISRUPT par l'instabilité déjà accumulée.
 - Simuler le tour de l'adversaire avec le même planner (il est assez rapide
   pour tourner deux fois) et éviter les cases qu'il va prendre.
@@ -270,7 +267,51 @@ distance totale.
 - Construire un graph global ne rapporte pas beaucoup de points par rapport à
   faire plein de liaisons rapidement. Trop lent.
 
+## Protocole de mesure
+
+**Ne jamais comparer deux candidats l'un contre l'autre.** Le planner est
+déterministe : deux versions proches visent la même case au même tour, le
+moteur marque le rail `NEUTRAL_OWNER`, personne ne le possède, aucune
+connexion ne paie. **v3.4 contre lui-même donne 0-0 systématiquement.**
+
+Le duel v3.8 vs v3.4 a ainsi rendu 636 nulles sur 930 et un verdict de 0,0 %,
+alors que v3.8 vaut 94,1 % contre un adversaire tiers. Le biais est d'autant
+plus fort que les deux versions se ressemblent, donc il frappe exactement les
+comparaisons qu'on veut faire.
+
+Le bon protocole : **les deux candidats contre un même adversaire tiers**, et
+on compare les deux taux.
+
+```sh
+cg-colosseum compare <candidat>  v3.1 -n 300 -s -t 8 --no-log
+cg-colosseum compare <reference> v3.1 -n 300 -s -t 8 --no-log
+```
+
+Signal d'alarme : un taux de nulles élevé, ou un verdict extrême (0 %, 100 %)
+sans nulles du côté opposé, veut dire que la mesure est cassée, pas que le bot
+l'est.
+
 ## Versions
+
+### v3.8 — abandonnée
+
+`partOfActiveConnections` exploité par case : une case vide sur un chemin
+payant vaut ce qu'elle rapporterait par tour, doublé si elle jouxte un rail
+adverse payant. Mesuré contre v3.1 : **94,1 %** contre **96,7 %** pour v3.4.
+N'apporte rien avec `INCOME_WEIGHT = 12`, le seul poids essayé.
+
+### v3.7 — abandonnée
+
+Mélange des deux routes : terrain (ligne long terme, poids 3) + réseau (rails
+gratuits, poids `1 + 24/restant`). 37,3 % contre v3.4 — mais mesuré avec le
+protocole biaisé, donc à reprendre si l'idée est relancée. Défaut constaté :
+99 % de la valeur se déposait sur des cases injouables.
+
+### v3.6 — abandonnée
+
+Ne payer que les cases vides du chemin. 1,6 % contre v3.4, chiffre lui aussi
+suspect (protocole biaisé). Enseignement retenu : les cases déjà railées
+portent la mémoire du tracé d'un tour sur l'autre.
 
 ### v3.4
 

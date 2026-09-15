@@ -1,4 +1,4 @@
-// v3.4
+// v3.7
 
 // Greedy one-turn planner. No search, no lookahead: every turn the board is
 // scored once, cell by cell, and the rails go on the best cells the paint can
@@ -7,8 +7,11 @@
 // A cell's value is built in three layers:
 //   1. a flat bonus if its region holds a town -- such a region can never be
 //      inked, so a rail laid there is never erased;
-//   2. W+H-length for every shortest town-to-town path crossing it, so the
-//      short wishes (the ones a turn can actually finish) weigh most;
+//   2. two routes per wish, rewarded together: the TERRAIN one (cheapest
+//      across the ground, blind to rails) keeps the long-term line in view,
+//      and the NETWORK one (rails free to cross) points at the few cells that
+//      would finish the job right now. At 30% rail coverage they share under
+//      half their cells, so the two really do say different things;
 //   3. scaled down by how close its region is to being inked.
 //
 // The DISRUPT target is read off the same map, between layers 2 and 3: the
@@ -52,6 +55,15 @@ static const int INK_INSTABILITY_THRESHOLD = 4;
 // division is never performed: it is the same for every cell, so dropping it
 // leaves the ranking untouched and the values exact.
 static const int INK_SCALE = INK_INSTABILITY_THRESHOLD + 1;
+
+// The long-term line's weight, and the network route's floor. The line is
+// worth more on its own: it is the only term that survives a wish being
+// finished, and v3.6 showed that losing sight of a built corridor is fatal.
+static const int TERRAIN_WEIGHT = 3;
+static const int NETWORK_WEIGHT = 1;
+// Divided by the cells still missing, so a nearly-done wish outranks a fresh
+// one. Sized against TERRAIN_WEIGHT: at 2 cells left it is worth 6 lines.
+static const int NEAR_BONUS = 24;
 
 // Direction priority: NORTH, EAST, SOUTH, WEST.
 static const int DIR_X[4] = {0, 1, 0, -1};
@@ -557,11 +569,42 @@ private:
 
     // ---- layer 1 + 2: the value map ----
 
+    // Both routes of every wish, rewarded together.
+    //
+    // The terrain route is the long-term line: cheapest across the ground,
+    // blind to rails, so it never moves and the planner always knows where the
+    // connection is ultimately meant to run. It carries the base weight.
+    //
+    // The network route crosses existing rails for free, so it points at the
+    // few cells that would close the wish right now. Its weight rises as the
+    // work left shrinks -- a wish two cells from paying out shouts, a virgin
+    // one stays quiet -- which is what v3.5 got right.
+    //
+    // What v3.5 got wrong was letting a finished wish keep shouting: with
+    // nothing left to build it scored the maximum, on cells that all carried a
+    // rail. Here a wish with no work left is skipped on the network route; its
+    // terrain route still holds the line.
     void buildValueMap(const Map &board)
     {
         value = baseValue; // same size, so a plain copy of the bytes
         for (const auto &link : links)
-            addPathReward(board, link.first, link.second);
+        {
+            // The line, always.
+            addPathReward(board, link.first, link.second, false, TERRAIN_WEIGHT);
+
+            // Measured at scale 0: the network route is walked to learn how
+            // much is left, without touching the map.
+            const int left =
+                addPathReward(board, link.first, link.second, true, 0);
+            if (left <= 0)
+                continue; // already connected: the line alone keeps it in view
+
+            // NEAR_BONUS / left, so two cells left outweighs ten. Capped so a
+            // single remaining cell cannot swamp every other wish on the map.
+            const int urgency = min(NEAR_BONUS / left, NEAR_BONUS / 2);
+            addPathReward(board, link.first, link.second, true,
+                          NETWORK_WEIGHT + urgency);
+        }
 
         // The cells the paths and the town bonus left untouched. Pinned here,
         // once, so every later diffusion ring writes only into this set: a
@@ -575,19 +618,28 @@ private:
     // it rewarded W+H-cost -- so a short connection, the kind a turn can
     // actually finish, weighs more than a long one. The path is never stored:
     // the parent chain is walked straight back from the destination.
-    void addPathReward(const Map &board, Coord src, Coord dst)
+    // `reuseNetwork` picks which of the two routes is walked: false is the
+    // terrain route of v3.4, true the network one that crosses rails for free.
+    // Returns the cells that still have to be paid for on it, or -1 when the
+    // towns are walled apart.
+    int addPathReward(const Map &board, Coord src, Coord dst,
+                      bool reuseNetwork, int rewardScale)
     {
         const int srcIdx = src.y * W + src.x;
         const int dstIdx = dst.y * W + dst.x;
         if (srcIdx == dstIdx)
-            return;
+            return -1;
 
         stamp++;
         heap.clear();
         gScore[srcIdx] = 0;
         gStamp[srcIdx] = stamp;
         parent[srcIdx] = -1;
-        heap.push_back(packHeap(heuristic(srcIdx, dst), srcIdx));
+        // Manhattan is only admissible while every step costs at least 1, and
+        // a railed cell costs 0 on the network route -- measured at 19% of
+        // routes wrong when the heuristic was kept. So that route runs as
+        // plain Dijkstra (h == 0); the terrain route keeps its heuristic.
+        heap.push_back(packHeap(reuseNetwork ? 0 : heuristic(srcIdx, dst), srcIdx));
 
         int total = -1;
         while (!heap.empty())
@@ -599,7 +651,8 @@ private:
             const int cur = (int)(top & 0xFFFFFFFFu);
             const int g = gScore[cur];
             // Stale entry: a shorter path to `cur` was found after this push.
-            if ((int)(top >> 32) != g + heuristic(cur, dst))
+            const int h = reuseNetwork ? 0 : heuristic(cur, dst);
+            if ((int)(top >> 32) != g + h)
                 continue;
             if (cur == dstIdx)
             {
@@ -616,7 +669,11 @@ private:
                 // Ink is impassable: a path through it could never be built.
                 if (board.isInked(nx, ny))
                     continue;
-                const int step = terrainCost(board.tileType(nx, ny));
+                // On the network route an existing rail or town costs
+                // nothing: whoever owns it, it already links what it touches.
+                const int step = (reuseNetwork && board.isConnectable(nx, ny))
+                                     ? 0
+                                     : terrainCost(board.tileType(nx, ny));
                 if (step == INT_MAX)
                     continue;
 
@@ -627,18 +684,34 @@ private:
                 gScore[nIdx] = ng;
                 gStamp[nIdx] = stamp;
                 parent[nIdx] = cur;
-                heap.push_back(packHeap(ng + heuristic(nIdx, dst), nIdx));
+                heap.push_back(packHeap(
+                    ng + (reuseNetwork ? 0 : heuristic(nIdx, dst)), nIdx));
                 push_heap(heap.begin(), heap.end(), greater<uint64_t>());
             }
         }
 
         if (total < 0)
-            return; // walled apart by ink: nothing to steer towards
+            return -1; // walled apart by ink: nothing to steer towards
 
-        // Never zero, so a path longer than the board still marks its cells.
-        const int reward = max(1, W + H - total);
+        // Cells on the route that still have to be paid for. On the terrain
+        // route this is only reported, not used: that route is the long-term
+        // line and must keep its value whatever is built on it.
+        int remaining = 0;
+        for (int cur = dstIdx; cur != -1; cur = parent[cur])
+            if (!board.isConnectable(cur % W, cur / W))
+                remaining++;
+
+        // Never zero, so a route longer than the board still marks its cells.
+        const int reward = max(1, W + H - total) * rewardScale;
+
+        // Every cell of the route is paid, built ones included. v3.6 paid only
+        // the empty cells and collapsed to 1.6%: the railed cells are what
+        // keeps the line visible from one turn to the next, so dropping them
+        // leaves the planner staring at disconnected fragments.
         for (int cur = dstIdx; cur != -1; cur = parent[cur])
             value[cur] += reward;
+
+        return remaining;
     }
 
     int heuristic(int idx, Coord dst) const

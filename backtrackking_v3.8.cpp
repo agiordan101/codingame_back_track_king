@@ -1,4 +1,4 @@
-// v3.4
+// v3.8
 
 // Greedy one-turn planner. No search, no lookahead: every turn the board is
 // scored once, cell by cell, and the rails go on the best cells the paint can
@@ -52,6 +52,12 @@ static const int INK_INSTABILITY_THRESHOLD = 4;
 // division is never performed: it is the same for every cell, so dropping it
 // leaves the ranking untouched and the values exact.
 static const int INK_SCALE = INK_INSTABILITY_THRESHOLD + 1;
+
+// What one point of income per turn is worth against a path reward. A live
+// connection pays its owner 1 point per turn per rail they own on it, for the
+// rest of the game, so a cell on a busy path is worth far more than one cell
+// of progress towards a connection that does not exist yet.
+static const int INCOME_WEIGHT = 12;
 
 // Direction priority: NORTH, EAST, SOUTH, WEST.
 static const int DIR_X[4] = {0, 1, 0, -1};
@@ -203,6 +209,11 @@ public:
     // Region, so a region's state is one indexed read.
     vector<char> regionInkedFlag;
     vector<unsigned char> regionInstability;
+    // Per cell, how many live connections run through it, straight from the
+    // referee's partOfActiveConnections field. A connection pays its owner 1
+    // point per turn per rail they hold on it, so this is literally what a
+    // cell earns -- no pathfinding of ours can be more accurate than this.
+    vector<unsigned char> activeCount;
     // The immutable half, shared rather than owned.
     const StaticMap *stat = nullptr;
 
@@ -265,6 +276,7 @@ public:
 
         regionInkedFlag.assign(target.regions.size(), 0);
         regionInstability.assign(target.regions.size(), 0);
+        activeCount.assign((size_t)w * h, 0);
     }
 
     // Reads the town block, appending every wish found to outWishes.
@@ -316,17 +328,23 @@ public:
                 string inkedStr, partStr;
                 in >> tracksOwner >> instability >> inkedStr >> partStr;
                 bool inked = (inkedStr != "0");
+                int liveHere = 0;
                 if (partStr != "x")
                 {
                     stringstream ss(partStr);
                     string conn;
                     while (getline(ss, conn, ','))
                     {
+                        liveHere++;
                         int fromTownId, toTownId;
                         sscanf(conn.c_str(), "%d-%d", &fromTownId, &toTownId);
                         outActiveConnections[{fromTownId, toTownId}] = true;
                     }
                 }
+                // Saturated at 255; boards run to a handful of connections.
+                activeCount[(size_t)y * grid.width + x] =
+                    (unsigned char)min(liveHere, 255);
+
                 Tile &tile = grid.get(x, y);
                 // An inked region is erased, whatever the referee reports.
                 tile.tracksOwner = (int8_t)(inked ? NO_OWNER : tracksOwner);
@@ -389,6 +407,12 @@ public:
     }
 
     int railCost(int x, int y) const { return terrainCost(grid.get(x, y).type); }
+
+    // How many live connections cross this cell, as the referee reports them.
+    int activeConnectionsAt(int x, int y) const
+    {
+        return activeCount[(size_t)y * grid.width + x];
+    }
 
     // Part of the live network: a town, or a rail outside ink.
     bool isConnectable(int x, int y) const
@@ -562,6 +586,7 @@ private:
         value = baseValue; // same size, so a plain copy of the bytes
         for (const auto &link : links)
             addPathReward(board, link.first, link.second);
+        addIncomeReward(board);
 
         // The cells the paths and the town bonus left untouched. Pinned here,
         // once, so every later diffusion ring writes only into this set: a
@@ -644,6 +669,54 @@ private:
     int heuristic(int idx, Coord dst) const
     {
         return abs(idx % W - dst.x) + abs(idx / W - dst.y);
+    }
+
+    // What the board already pays, read straight off the referee rather than
+    // guessed at: partOfActiveConnections names, per cell, the live
+    // connections running through it, and each one pays its owner 1 point per
+    // turn per rail they hold on it -- every turn, for the rest of the game.
+    //
+    // Two kinds of cell are worth taking, and both are free money the planner
+    // has never looked at:
+    //
+    //   - an EMPTY cell on a paying path: laying a rail there starts earning
+    //     immediately, once per connection crossing it. A cell serving several
+    //     connections pays several points a turn.
+    //
+    //   - an empty cell NEXT TO one the opponent holds on a paying path: we
+    //     cannot take his cell, but a rail beside it can become the shorter
+    //     route, moving the payment from him to us. Worth double, since it
+    //     both adds to us and takes from him.
+    //
+    // Only empty, playable cells are paid: unlike a path reward, this term
+    // says "act here", so putting it anywhere else would just dilute it.
+    void addIncomeReward(const Map &board)
+    {
+        for (int y = 0, idx = 0; y < H; y++)
+        {
+            for (int x = 0; x < W; x++, idx++)
+            {
+                if (!board.canPlaceRail(x, y))
+                    continue;
+
+                // Paid once per connection already crossing this very cell.
+                int income = board.activeConnectionsAt(x, y);
+
+                // Plus what the neighbours are paying the opponent: taking
+                // that trade over is worth twice adding a fresh point.
+                for (int k = 0; k < 4; k++)
+                {
+                    const int nx = x + DIR_X[k], ny = y + DIR_Y[k];
+                    if (!board.inBounds(nx, ny))
+                        continue;
+                    if (board.tileOwner(nx, ny) != foeId)
+                        continue;
+                    income += 2 * board.activeConnectionsAt(nx, ny);
+                }
+
+                value[idx] += income * INCOME_WEIGHT;
+            }
+        }
     }
 
     // (f, cell) in one word, so the heap compares a single 64-bit integer.
