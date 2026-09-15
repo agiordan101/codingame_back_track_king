@@ -2,239 +2,106 @@
 
 CodinGame Summer Challenge 2026
 
-## Chosen algorithms
+## Chosen algorithm
 
-### BEAM search
+### Greedy value map (v3.0)
 
-#### "Rail placement choice"s création
+Pas de recherche du tout. Chaque tour, le plateau est noté une fois, case par
+case, et les rails vont sur les meilleures cases que la peinture permet. Un
+tour coûte ~100 µs au lieu des 30 ms du beam.
 
-1. Select all desired connection not yet built
-2. For each of those
-    - Find and create two rails group that are connected to the towns
-    - Iterate over cross-product of those two groups to identify all potentials connection, and keep the shortest one (using manhattan distance)
-3. We end up with all shortest path to build desired connections. A paht being 2 tiles/Coordonates
+**Au début de la partie** (`Planner::init`)
 
-#### "Disrupt choice" création
+- Un tableau plat `baseValue[cell]` : `(W+H)/4` si la région de la case
+  contient une ville, 0 sinon. Une région à ville ne peut jamais être encrée,
+  donc un rail posé là n'est jamais effacé. La valeur est calibrée au quart
+  d'une récompense de chemin : assez pour départager deux cases d'un même
+  chemin, pas assez pour en battre un.
+- Les wishes sont résolus une fois en paires de coordonnées, dédupliqués
+  (l'arbitre annonce chaque liaison depuis ses deux villes).
+- `cellSlot[cell]` : la région de chaque case, aplatie en `int16` — les
+  balayages par région n'ont ainsi jamais à repasser par `regionId`.
 
-All régions which respect all conditions :
-- Not inked
-- No town
-- Opponent rail
-- For each unique region rail within a valid connection :
-    - Count all unique player rails inside the connection
-- Sum rails count for both players
-- Keep regions where opponent has a bigger count of rails than mine
+**Chaque tour** (`Planner::plan`)
 
-Create only the best one
+1. `value = baseValue` (une copie mémoire, même taille, pas de réallocation).
+2. Pour chaque wish, A* sur le terrain (encre infranchissable) entre les deux
+   villes, *active ou non*. Chaque case du chemin reçoit `W+H-coût`, donc les
+   liaisons courtes — les seules qu'un tour peut finir — pèsent le plus. Le
+   chemin n'est jamais stocké : on remonte la chaîne de parents depuis la
+   destination en ajoutant au passage.
+3. **DISRUPT** : un balayage linéaire somme, par région, `+value` sous un rail
+   adverse et `-value` sous un des miens. La meilleure région non encrée et
+   sans ville est la cible, ou aucune si le meilleur score est ≤ 0.
+4. `value *= (INK_SCALE - instabilité)` par région. La division par
+   `INK_SCALE` de la formule `(5 - inkLevel) / 5` n'est jamais faite : elle est
+   la même pour toutes les cases, donc la supprimer laisse le classement
+   intact et garde les valeurs exactes en entier.
+5. **Rails** : jusqu'à trois tours de boucle, chacun un balayage linéaire qui
+   garde la meilleure case jouable et abordable. Le deuxième rail est donc
+   choisi en sachant le premier.
 
-#### "Rail placement choice" application
+Le choix des rails se fait sur une clé 64 bits construite en place
+(`value << 23 | touche-le-réseau << 22 | (3-coût) << 20 | (N-1-idx)`), donc la
+comparaison du balayage est un seul entier.
 
-Rule to place one player rails :
+**L'égalité est le cas normal**, pas l'exception : un chemin récompense toutes
+ses cases à l'identique. Les départages, dans l'ordre :
 
-We want to apply a path/"rail placement choice". We get 2 coordonate, the first being the source and second the destination
-The idea is to check around the source (4 adjacents cells) the closest cell (using A*) to the destination.
-If draw, prioritize in order with :
-- NORTH
-- EAST
-- SOUTH
-- WEST
-Once it's done, check the cost of the rail placement :
-- 1 point de peinture pour placer un rail sur les plaines.
-- 2 points de peinture pour placer un rail sur une rivière.
-- 3 points de peinture pour placer un rail sur les montagnes.
+1. **adjacent au réseau** (rail ou ville voisine, y compris un rail posé plus
+   tôt dans le même tour). C'est ce qui transforme une ligne de cases égales
+   en une ligne *construite* : sans lui le remplissage suivrait l'ordre de
+   balayage et fragmenterait le chemin.
+2. **terrain le moins cher** — à valeur égale, une plaine laisse deux rails de
+   plus dans le tour qu'une montagne.
+3. **ordre de balayage**, pour rester déterministe.
 
-and repeat until 3 points are spent.
+### Critiques de l'algorithme
 
-Then add rails onto map. Be careful, both player must add they rails at the same time
-
-#### Game engine turn choices application
-
-- Start with state D
-- Pick one of my rails creation
-- Pick one of opp rails creation
-- Apply both rails creation
-- Apply chosen disrupts
-- Ink regions
-- Compute new player points
-- End with state D+1
-
-#### BEAM iterations
-
-1. Start with parameter current_state
-2. Copy current_state in turn_state
-3. Generate rail choices with section "Rail placement choices création"
-4. Generate my best disrupt choices with section "Disrupt choices"
-4. Generate opp best disrupt choices with section "Disrupt choices"
-7. Iterate over rails choices
-   - Copy turn_state in current_state
-   - Create state D+1 with section "Game engine turn choices application"
-   - Use heuristic function to evaluate state D+1
-   - Keep the state D+1 if heuristic score if best than current Bwidth lowest one
-8. End with Bwidth new states
-
-Bwidth = 20
-maxDepth=10
-
-### Heuristic
-
-Dans un beam search, l'heuristic permet de comparer des état ayant le même état parent. Ces état viennent d'avoir leur score update siute au tour.
-Donc un état qui créer de meilleur connection pour moi ou casse des connectino pour l'adversaire va impacter en conséquence les points.
-Ce qui veut dire qu'on a pas besoin dans l'heuristic de récompenser/malus ses rails et les rails de l'adveraire sur les chemins les plus court existants.
-
-Il faut juste diriger l'algo vers la création de ces chemins.
-Pour ça on veut juste savoir les gap de distance entre les groupes de rails lié à 2 towns qui veulent être lié.
-
-Si l'heuristic reste très basique alors on peut faire plus de simulation, et donc s'orienter vers des cas où les points augmente.
-
-### Idées
-
-#### GA pour construire un graph pondéré
-
-Trouver la longeur des chemins de rails les plus court entre chaque ville (matrice de taille NbVille * NbVille)
-Créer un graph pondéré avec comme configuration par défault les liaisons de ville demandé.
-Faie un GA qui va couper et créer des liaisons pondéré pour minimiser la distance totale de TOUTE les liaisons du graph.
-Les graph qui ne posède pas les liaisons de ville demandé doivent être extremement déavantagé.
-
-FONTIONNE PAS :
-- Les chemins doivent pouvoir être lié n'importe où, pas que sur des villes
-- Construire un graph blobale ne rapporte pas beaucoup de points par rapport à faire pleins de liaisons rapidemment. Trop lent
-
-## Game engine
-
-### Lookup tables
-
-On peut faire une LT qui garde une struct d'info "path" entre 2 cells :
-    - Distance A*
-    - List de région par lesquelles ont passe
-
-Une structure associé pourrait permettre de retrouver tous les path qui passe par une région. Créé en même temps
-De cette manière, lorsque la région est inked, on peut recalculer tous les paths qui l'utilisait
-
-
-### Cache A* results instead of lookup tables
-
-Each time we want a A* distance, verify if a cache entry exist :
-- If so, verify the inkedRegion count is the same as the cached value :
-    - If so, return it
-    - Else, compute A* distance, save in cache with inkedRegion count
-- If not, compute A* distance, save in cache with inkedRegion count
-
-### Pre-heuristic (`extendManhattanGap`)
-
-Le beam interne classe ses candidats avec un terme très rapide, sans BFS ni
-flood fill. Deux moitiés, additionnées :
-
-1. **Gaps à fermer** — pour chaque wish pas encore connecté, la marche
-   `villeA -> rail -> villeB`, pondérée en `1/baseline²` pour privilégier les
-   wishes courts (seuls ceux-là sont finissables en 3 rails, et seule une
-   connection finie rapporte). Seuls les deux meilleurs wishes comptent ; un
-   wish déjà ponté est mis de côté à sa valeur pleine pour ne pas bloquer un
-   slot et aplatir le score des rails suivants.
-
-2. **Chemins qui paient** — une connection active rapporte 1 point par rail
-   possédé sur son chemin, *chaque tour*. Les chemins actifs sont tamponnés une
-   fois par appel (`payOwner`), puis chaque candidat coûte 4 lectures de
-   tableau : un rail adjacent à un chemin qui paie vaut +1, +2 si l'adversaire
-   possède cette case (le tie-break N/E/S/O déterministe permet de détourner le
-   chemin et de lui prendre le point plutôt que d'en ajouter un).
-
-La moitié 2 est ce qui empêche le terme d'être aveugle quand tous les wishes
-sont connectés — l'état dans lequel se passe ~75% d'une partie.
-
-## Next steps
-
-- Tester l'algorithm suivant en greedy first (meilleur combinaison) SANS beam search pour voir ce que ca vaut
-- Idées pour le pruning des actions légales du beam search :
-    1. Avantages :
-        - Priorizer les cases étant sur les chemins les plus courts entre des villes
-        - Parmis les connection souhaité, priorizer les connections les plus courtes
-        - Prioriser les cases qui sont sur plusieurs chemin les plus courts
-        - Prioriser les cases qui ne peuvent pas être supprimé
-        - Ecarter les cases qui vont se faire inked
-        Algorithme :
-        - Chaque main beam node doit re-construire les A* path les plus court entre les villes
-        - On repart de la lookup table static ayant les cases uninkable déjà rewarded
-        - Pour chaque A* path (Utiliser la récursivité pour ne pas avoir a stocker les coords ?) :
-            - On ajoute à toutes les case du path la valeur : w+h-pathLength
-        - Pour chaque cases, on multiple la valeur par : (5 - inkLevel) / 5 (CALCUL PROPRE AU PRUNING, l'heuristique devra en avoir un différent: Plus permisiffe)
-        - On considère uniquement les cases adjacentes aux rails et villes existants
-        - On utilise LA meilleur combinaisons comme actionset de l'adversaire
-        - On créé ~10 combinaisons parmis les meilleurs cases comme étant les actionset possible de la node actuel du BEAM SEARCH :
-            * En créant toutes les combinaisons des N meilleures cases ? (3 parmis 5) = 10 (Moins en réalité parce que on va des fois avoir que 1 ou 2 rails à poser)
-            * Aléatoirement parmis les N meilleurs ? = Plus de varièté et de création de chemins en parralle ?
-            Sachant que :
-                N=5  -> (3 parmis 5)  =  10 combinaisons
-                N=7  -> (3 parmis 7)  =  35 combinaisons
-                N=10 -> (3 parmis 10) = 120 combinaisons
-
-- Idées pour l'heuristic principale :
-  - Différence de score
-  - Nombre de connection active ! Osef parce que ca peut autant être bien pour ladversaire que pour moi
-  - sum de 0 ou x si le rail est dans une région inkable (Uninkable regions > inkable regions)
-  
-- Cache/incrementalize openGapTotal — the single highest-value change. It re-does a full multi-component flood-fill per node when consecutive nodes differ by only ~3 rails.
-<!-- - openGapTotal prends 1/2 du temps total.. Supprimer entierement et refaire le cache a* avec invalidation quand région supprimé. -->
-<!-- - Lister les endroits ou on fait des floodfill/a* et mettre en cache tout ça -->
-
-### Optimizations list
-
-Here are the optimizations, ranked by expected gain.
-
-3. Avoid constructing children you'll discard
-You build all ~1200 children then keep 30. Since evaluate needs the simulated board you can't score-before-build directly, but you can:
-
-Reuse node storage across depths. Keep two vector<BeamNode> buffers as members, clear() instead of reallocating; nextBeam.reserve(beam.size() * NESTED_BEAM_WIDTH) once. Right now nextBeam is constructed fresh per depth and push_back reallocates ~11 times, each realloc moving every node.
-Cheap prefilter: myTurns from generateActionSets is already ranked by closedGap. Only the top-K per parent can realistically survive the global cut. If NESTED_BEAM_WIDTH=40 but the global beam is 30, expanding 40 children from each of 30 parents to keep 30 total is heavily wasteful. Try min(NESTED_BEAM_WIDTH, 8) at depth > 0 and measure — you'd likely get 2–3 extra depths for the same budget, which is worth far more than breadth at a single depth.
-
-4. Structural criticism of the search itself
-generateActionSets is called twice per node (foe then self), and the foe call only uses foeTurns.front(). That's a full nested beam (NESTED_BEAM_WIDTH=40 lines) to extract one answer. Call it with width 1–4 for the foe. Potentially a ~40% cut of total search time on its own.
-The foe plan is recomputed at every node even though sibling nodes at depth 0 share the identical node.state (all children of the same parent see the same board before your rails). Hoist and cache it per parent — you already do, but it's per-node, and at depth 0 there's exactly one node so that's fine; at deeper depths siblings diverge, so nothing to gain there. The width reduction is the real fix.
-outOfTime() calls steady_clock::now() per action — that's a vDSO call, ~20–25 ns. With ~1200 actions/depth × 5 depths it's ~150 µs, ~0.3% of a 50 ms budget. Acceptable, but if you shrink the per-child cost as above it becomes relatively significant; check every 8th iteration with a counter mask.
-Ordering the merge: at main.cpp:2374 the merged previous beam is already sorted. You could std::merge the sorted old beam with the ranked new children instead of re-ranking everything — minor once the index-sort is in.
-Suggested order of work: (2a) shared static Map + Tile shrink, then (1) index-sort, then (4) foe width. (2a) alone should be the multiplier.
+- **Le classement ignore le prix.** Une montagne à 100 bat trois plaines à 90,
+  alors que les trois plaines valent 270 pour la même peinture. Trier sur
+  `valeur / coût` (ou faire un vrai sac à dos sur 3 points de peinture, ce qui
+  est trivial à cette taille) est le changement le plus rentable à essayer.
+- **Les chemins A* ignorent les rails déjà posés.** Une liaison déjà active
+  par un autre tracé continue d'attirer des rails sur son chemin *théorique*,
+  qui ne sert plus à rien. Donner un coût 0 aux cases déjà railées ferait
+  fondre la récompense sur le travail restant — et ferait monter les liaisons
+  presque finies en tête, ce qui est exactement le bon réflexe.
+- **Rien ne regarde l'adversaire** en dehors du DISRUPT. Le beam simulait son
+  tour ; ici il peut prendre la case visée sans qu'on le voie venir.
+- **Un seul chemin par wish.** Deux tracés de même longueur existent souvent ;
+  n'en récompenser qu'un fixe arbitrairement le tracé. Récompenser toutes les
+  cases sur *un* plus court chemin (un double A* depuis chaque ville, garder
+  `dA + dB == distance`) donnerait un couloir plutôt qu'une ligne.
+- **Le DISRUPT ne tient pas compte de l'instabilité déjà accumulée.** Une
+  région à 3/4 est à un coup de l'encre, une région à 0/4 en demande quatre :
+  à score égal la première vaut bien plus.
 
 ## Debug viewer
 
-`tools/` contient une interface qui affiche la map et les valeurs internes de
-l'algo : pour chaque case candidate, le `closedGap` que le beam interne lui a
-donné — à quel point la ligne sert les deux wishes qu'elle sert le mieux,
-pondéré vers les wishes courts, donc plus c'est haut mieux c'est. Une heatmap
-uniforme veut dire que tous les wishes sont déjà connectés. `main.cpp` reste compilable et jouable seul — c'est `make check` qui
-le garantit, et le binaire de compétition est inchangé au bit près (les hooks
+`tools/` contient une interface qui affiche la map et **la valeur que
+l'algorithme a donnée à chaque case** ce tour-là — exactement le nombre sur
+lequel le coup a été lu. Un tour = une seule carte (le planner note tout le
+plateau d'un coup), donc plus de rounds ni de préfixes à sélectionner.
+
+`main.cpp` reste compilable et jouable seul — c'est `make check` qui le
+garantit, et le binaire de compétition est inchangé au bit près (les hooks
 sont des macros vides hors `DEBUG_TOOL`).
 
-### Les 3 heatmaps d'un tour
+Sur le plateau :
 
-Le beam interne choisit les 3 rails d'un tour un par un : un round par rail.
-Chaque round est capturé séparément, donc un tour porte jusqu'à **3 heatmaps** —
-sélectionnables dans le panneau « Rail du tour » (ou touches <kbd>1</kbd>–<kbd>3</kbd>).
+- **heatmap + chiffre** dans chaque case jouable : la valeur finale, après la
+  remise d'encre. Les zéros sont laissés vides, ils sont la majorité.
+- **anneaux blancs numérotés** sur les rails posés ce tour, dans l'ordre où le
+  planner les a choisis.
+- **contour orange** autour de la région DISRUPT.
+- le panneau latéral classe les régions encrables par score de disrupt, et le
+  survol d'une case donne sa valeur, sa région et son score.
 
-Un round score ses cases contre un plateau qui inclut déjà les rails posés par
-les rounds précédents. Chaque heatmap affiche donc ce que son préfixe a **déjà
-fermé** (`prefixGap`, nul sur le premier rail), et les gains se lisent « ce que
-ce rail ajoute au précédent », pas « par rapport au plateau vierge ». Les coups
-déjà appliqués (0, 1 ou 2) sont remplis et numérotés sur la carte.
-
-Deux cases seulement sont entourées, celles qui posent la question — et leur
-couleur est la réponse :
-
-- **anneau blanc unique** : le rail choisi *est* la meilleure case. Rien à
-  expliquer.
-- **vert + rouge** : ils divergent. Vert sur le gain maximum (repère en haut à
-  gauche), rouge sur le rail réellement choisi (repère en bas à droite).
-
-En vue adversaire il n'y a que l'anneau vert : son coup n'est jamais imprimé.
-Sur la partie rejouée, 78 rounds sur 91 divergent et 13 concordent — c'est cet
-écart que l'outil sert à regarder.
-
-Le rouge tire vers l'orange à dessein : un rouge pur se confondrait avec les
-rails du joueur et avec le haut du gradient rose-rouge.
-
-Un round garde 40 lignes survivantes, donc il score ses cases contre beaucoup
-de préfixes différents — un seul peut tenir sur une carte. Pour nous, c'est la
-lignée qui a *réellement* été jouée qui est suivie (les préfixes correspondent
-exactement aux premiers coups de la décision) ; pour l'adversaire, dont le coup
-n'est jamais imprimé, c'est la meilleure ligne à chaque profondeur.
+Contrairement au beam, **le planner est déterministe** : il ne s'arrête pas
+sur l'horloge. Rejouer le même log avec le même binaire donne exactement la
+même sortie, et un replay qui diffère du log veut dire que le log a été écrit
+par une autre version du bot.
 
 ```sh
 make replay LOG=.colosseum/logs/firstenv/run-*/game_*_p0.events.jsonl
@@ -297,36 +164,73 @@ images.
   qui est observé, jamais une réimplémentation.
 - `tools/serve.py` — sert le viewer et les dumps (stdlib seule).
 - `tools/viewer.html` — Canvas : terrain, régions, rails, villes, encre, et la
-  heatmap des candidats. La case jouée est entourée ; le panneau latéral
-  compare le gain maximum au rail effectivement posé.
+  carte des valeurs.
 
 Mode live : `./tools/btk-debug live tools/dumps` se comporte comme le bot
 (stdin/stdout) et dépose un dump par tour à côté. Utilisable directement comme
 bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
-L'outil garde le budget de `main.cpp` (30 ms, 900 au premier tour) : les
-valeurs affichées sont celles que le bot jouera vraiment sur CodinGame.
+## Idées à essayer
 
-Un replay reproduit le match de près, mais pas à l'identique, et la raison
-tient au bot lui-même : **la recherche s'arrête sur l'horloge, pas sur un
-nombre d'itérations, donc elle n'est pas déterministe**. Rejouer cinq fois le
-même tour avec le même binaire sur la même entrée donne des sorties
-différentes — le beam tronque à un point qui suit les micro-variations de
-charge de la machine.
+- Sac à dos sur les 3 points de peinture plutôt qu'un greedy par valeur brute
+  (voir les critiques ci-dessus).
+- Couloir de plus courts chemins plutôt qu'un seul tracé, par double A*.
+- A* à coût 0 sur les rails existants, pour que la récompense mesure le
+  travail restant et non la distance théorique.
+- Pondérer le score de DISRUPT par l'instabilité déjà accumulée.
+- Simuler le tour de l'adversaire avec le même planner (il est assez rapide
+  pour tourner deux fois) et éviter les cases qu'il va prendre.
 
-Mesuré sur un log v2.2 de 25 tours : 17 tours rejouent la sortie exacte, 3
-posent les mêmes cases dans un autre ordre (sans conséquence pour l'arbitre),
-5 diffèrent. Sur le premier rail — celui que la heatmap explique — 22 tours
-sur 25 coïncident : la divergence porte presque toujours sur le 2ᵉ ou 3ᵉ rail.
+## Historique — BEAM search (v2.x)
 
-Conséquence pratique : un dump décrit fidèlement *une* exécution de la
-recherche à 30 ms, ce qui est bien ce qu'on veut inspecter, mais deux dumps du
-même tour peuvent différer. Les valeurs de la heatmap, elles, sont stables :
-`extendManhattanGap` ne dépend pas du temps.
+Le code de ces versions est dans `backtrackking_v2.*.cpp`.
 
-## Explanations
+Deux beam searches imbriqués : l'extérieur planifiait les tours à venir, et
+pour chacun de ses nœuds l'intérieur décidait les rails du tour une case à la
+fois. Les deux étaient interruptibles et jouaient la meilleure ligne trouvée
+quand le budget de 30 ms tombait.
+
+- **Création des placements** : toute case abordable touchant le réseau, notée
+  par ce qu'elle raccourcit des wishes restants (`extendManhattanGap`).
+- **Heuristique d'état** (`evaluate`) : revenu par tour, moins `GAP_PENALTY`
+  par case de gap restant, mesuré par un flood fill multi-source
+  (`openGapTotal`) qui lit où deux composantes se rencontrent.
+- **DISRUPT** : la région où l'adversaire possède le plus de rails de
+  connexion de plus que moi.
+
+Ce qui l'a fait abandonner : `openGapTotal` prenait la moitié du temps total
+et refaisait un flood fill complet par nœud alors que des nœuds consécutifs ne
+diffèrent que de ~3 rails ; et la profondeur atteinte restait faible.
+
+### Idées de l'époque encore valables
+
+- Une lookup table de `path` entre 2 cases (distance A* + liste des régions
+  traversées), plus un index inverse région → chemins, pour ne recalculer que
+  les chemins invalidés quand une région est encrée. `PathTable` faisait ça en
+  v2.x ; le planner v3 recalcule tout, ce qui coûte moins cher que le cache à
+  cette taille de plateau.
+- Pour le pruning des actions : prioriser les cases sur plusieurs plus courts
+  chemins, celles qui ne peuvent pas être encrées, écarter celles qui vont
+  l'être. C'est devenu la carte de valeurs de v3.
+
+### GA pour construire un graph pondéré — ne fonctionne pas
+
+Trouver la longueur des chemins les plus courts entre chaque ville, créer un
+graph pondéré, faire un GA qui coupe et crée des liaisons pour minimiser la
+distance totale.
+
+- Les chemins doivent pouvoir être liés n'importe où, pas que sur des villes.
+- Construire un graph global ne rapporte pas beaucoup de points par rapport à
+  faire plein de liaisons rapidement. Trop lent.
 
 ## Versions
+
+### v3.0
+
+Greedy sans recherche : une carte de valeurs par tour, les rails sur les
+meilleures cases abordables. ~100 µs par tour au lieu de 30 ms.
+
+Battle locale contre v2.8 (121 parties, positions échangées) : **92.9 % — 7.1 %**.
 
 ### v2.8
 

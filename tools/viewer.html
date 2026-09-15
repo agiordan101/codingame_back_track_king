@@ -34,11 +34,9 @@
        off both rail hues. */
     --accent:     #1a1a1a;
     --focus:      #1f5fd0;
-    /* Rings on the two cells a round puts against each other. The green is
-       pushed cold to sit opposite the pink-to-red heat ramp; the red is pushed
-       towards orange, since a pure red would read as one of our own rails and
-       as the top of that same ramp. */
-    --best:       #00e07a;
+    /* The outline round the region this turn disrupts. Pushed towards orange:
+       a pure red would read as one of our own rails, and as the top of the
+       pink-to-red heat ramp. */
     --taken:      #ff6a00;
 
     --heat-0:     #fbe4ee;
@@ -72,7 +70,6 @@
 
       --accent:    #f2f4f0;
       --focus:     #5599ff;
-      --best:      #00e07a;
       --taken:     #ff5a5f;
 
       --heat-0:    #4a1a2c;
@@ -105,7 +102,6 @@
 
     --accent:    #f2f4f0;
     --focus:     #5599ff;
-    --best:      #00e07a;
     --taken:     #ff5a5f;
 
     --heat-0:    #4a1a2c;
@@ -266,6 +262,8 @@
 
   dt { color: var(--ink-soft); }
   dd { margin: 0; text-align: right; }
+  dd .note { color: var(--ink-faint); }
+  dt b { color: var(--ink); }
 
   /* Legend and ramp share the swatch, so it is defined once. */
   .sw {
@@ -279,28 +277,18 @@
   /* Rails are discs on the board; the legend says so. */
   .sw.dot { border-radius: 50%; }
 
-  /* The two rings, with the corner tick that tells them apart. */
+  /* The two outlines the board draws: the cells played, and the region hit. */
   .sw.ring {
-    position: relative;
     background: var(--ink-faint);
     border: 2px solid #ffffff;
     box-shadow: 0 0 0 1px rgb(0 0 0 / 0.45);
   }
 
-  .sw.ring.tl { border-color: var(--best); }
-  .sw.ring.br { border-color: var(--taken); }
-
-  .sw.ring::after {
-    content: "";
-    position: absolute;
-    width: 3px;
-    height: 3px;
+  .sw.ring.disrupt {
+    background: transparent;
+    border-color: var(--taken);
+    box-shadow: none;
   }
-
-  .sw.ring.tl::after { top: -1px; left: -1px; background: var(--best); }
-  .sw.ring.br::after { bottom: -1px; right: -1px; background: var(--taken); }
-  /* The agreeing case carries no corner tick, exactly as on the board. */
-  .sw.ring.same::after { content: none; }
 
   .legend {
     display: flex;
@@ -328,8 +316,7 @@
     font-variant-numeric: tabular-nums;
   }
 
-  /* The one place the page raises its voice: the top cell the search scored
-     against the cell it actually played. Disagreement is the finding. */
+  /* The move itself: the cells played, each with the value that picked it. */
   .verdict {
     border-left: 3px solid var(--accent);
     padding: 8px 0 8px 10px;
@@ -339,7 +326,7 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .verdict.agree { border-left-color: var(--mine); }
+  .verdict.acted { border-left-color: var(--mine); }
   .verdict b { font-weight: 700; }
   .verdict .note { color: var(--ink-soft); }
 
@@ -368,34 +355,6 @@
     padding: 40px 0;
   }
 
-  /* The turn's three rails as a row of steps: the heatmap on screen is one of
-     them, and the row says which, and what was placed before it. */
-  .steps {
-    display: flex;
-    gap: 4px;
-  }
-
-  .steps button {
-    flex: 1;
-    padding: 6px 4px;
-    font-family: "JetBrains Mono", ui-monospace, monospace;
-    font-size: 11px;
-    line-height: 1.35;
-    text-align: center;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .steps button b {
-    display: block;
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    opacity: 0.7;
-  }
-
-  #stepNote { margin: 7px 0 0; }
-  #stepNote b { color: var(--ink); font-weight: 600; }
 
   @media (max-width: 900px) {
     .wrap { grid-template-columns: minmax(0, 1fr); }
@@ -416,10 +375,6 @@
       <button id="prev" title="Tour précédent (←)">◀</button>
       <input id="turn" type="number" min="1" value="1" aria-label="Numéro de tour">
       <button id="next" title="Tour suivant (→)">▶</button>
-      <select id="owner" aria-label="Joueur affiché">
-        <option value="me">Mes candidats</option>
-        <option value="foe">Candidats adverse</option>
-      </select>
       <button id="heat" aria-pressed="true" title="Heatmap (h)">Heatmap</button>
       <button id="nums" aria-pressed="true" title="Valeurs (n)">Valeurs</button>
       <button id="live" aria-pressed="false" title="Recharge toutes les 2s">Live</button>
@@ -432,12 +387,6 @@
 
   <aside>
     <section>
-      <h2>Rail du tour</h2>
-      <div class="steps" id="steps"></div>
-      <p class="hint" id="stepNote"></p>
-    </section>
-
-    <section>
       <h2>Tour</h2>
       <dl id="facts"></dl>
     </section>
@@ -448,9 +397,19 @@
     </section>
 
     <section>
-      <h2>Gain — score ajouté par la case</h2>
+      <h2>Disrupt — régions les mieux notées</h2>
+      <dl id="disrupts"></dl>
+      <p class="hint" id="disruptNote"></p>
+    </section>
+
+    <section>
+      <h2>Valeur d'une case</h2>
       <div class="ramp" id="ramp"></div>
       <div class="ramp-ends"><span id="rampLo">0</span><span id="rampHi">0</span></div>
+      <p class="hint">
+        Bonus région-ville + <i>W+H−longueur</i> par plus court chemin qui
+        traverse, le tout × (5 − instabilité).
+      </p>
     </section>
 
     <section>
@@ -459,10 +418,8 @@
         <div><i class="sw" style="background:var(--plains)"></i>Plaine — 1 peinture</div>
         <div><i class="sw" style="background:var(--river)"></i>Rivière — 2</div>
         <div><i class="sw" style="background:var(--mountain)"></i>Montagne — 3</div>
-        <div><i class="sw ring tl"></i>Gain maximum</div>
-        <div><i class="sw ring br"></i>Rail choisi</div>
-        <div><i class="sw ring same"></i>Les deux : le max a été pris</div>
-        <div><i class="sw" style="background:var(--accent)"></i>Coups déjà appliqués</div>
+        <div><i class="sw ring played"></i>Rails posés ce tour, numérotés</div>
+        <div><i class="sw ring disrupt"></i>Région DISRUPT</div>
         <div><i class="sw dot" style="background:var(--mine)"></i>Mes rails</div>
         <div><i class="sw dot" style="background:var(--foe)"></i>Rails adverses</div>
         <div><i class="sw dot" style="background:var(--neutral)"></i>Rails neutres</div>
@@ -473,8 +430,8 @@
     <section>
       <h2>Raccourcis</h2>
       <p class="hint">
-        <kbd>←</kbd> <kbd>→</kbd> tour · <kbd>1</kbd>–<kbd>3</kbd> rail ·
-        <kbd>h</kbd> heatmap · <kbd>n</kbd> valeurs · <kbd>o</kbd> joueur<br>
+        <kbd>←</kbd> <kbd>→</kbd> tour · <kbd>h</kbd> heatmap ·
+        <kbd>n</kbd> valeurs<br>
         Survolez une case pour le détail.
       </p>
     </section>
@@ -496,14 +453,13 @@ const ui = {
   turn:    document.getElementById("turn"),
   prev:    document.getElementById("prev"),
   next:    document.getElementById("next"),
-  owner:   document.getElementById("owner"),
   heat:    document.getElementById("heat"),
   nums:    document.getElementById("nums"),
   live:    document.getElementById("live"),
   facts:   document.getElementById("facts"),
   verdict: document.getElementById("verdict"),
-  steps:    document.getElementById("steps"),
-  stepNote: document.getElementById("stepNote"),
+  disrupts:    document.getElementById("disrupts"),
+  disruptNote: document.getElementById("disruptNote"),
   ramp:    document.getElementById("ramp"),
   rampLo:  document.getElementById("rampLo"),
   rampHi:  document.getElementById("rampHi"),
@@ -515,9 +471,6 @@ const state = {
   data: null,
   showHeat: true,
   showNums: true,
-  showFoe: false,
-  // Which of the turn's rails the heatmap describes: 0 is the first.
-  depth: 0,
   hover: null,
   liveTimer: null,
 };
@@ -568,44 +521,42 @@ async function loadTurn(n) {
 
 // ---- derived ----
 
-// A turn lays up to three rails, one beam round each, so a turn carries up to
-// three heatmaps. Rounds for the selected player, in the order the beam
-// decided them.
-function roundsFor(d) {
-  const owner = state.showFoe ? 1 - d.myId : d.myId;
-  return (d.rounds ?? [])
-    .filter((r) => r.owner === owner)
-    .sort((a, b) => a.depth - b.depth);
+// The planner scores the whole board once per turn, so a turn is exactly one
+// number per cell -- the very number the move was read off. Towns and inked
+// cells are left out: nothing can be built on them, so their value would only
+// add noise to the ramp.
+function valueMap(d) {
+  const W = d.width, H = d.height;
+  const townAt = new Set(d.towns.map((t) => t.y * 1000 + t.x));
+  const cells = [];
+  let lo = Infinity, hi = -Infinity, positives = 0;
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (d.inked[y][x] || townAt.has(y * 1000 + x)) continue;
+      const v = d.values?.[y]?.[x] ?? 0;
+      cells.push({ x, y, v });
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+      if (v > 0) positives++;
+    }
+  }
+  if (!cells.length) { lo = 0; hi = 0; }
+  return { cells, lo, hi, positives };
 }
 
-// One number per cell for the selected round: the gap that round gave a rail
-// laid there, as the gain over the board the round started from -- the board
-// after its prefix was placed, not the untouched one. `c.gap` is cumulative
-// gap closed by the whole line, so the prefix's own share comes back off.
-// Higher is better.
-function candidateMap(d) {
-  const rounds = roundsFor(d);
-  const round = rounds[Math.min(state.depth, rounds.length - 1)];
-  const byCell = new Map();
-  let lo = Infinity, hi = -Infinity;
-  for (const c of round?.candidates ?? []) {
-    const gain = c.gap - round.prefixGap;
-    byCell.set(c.y * 1000 + c.x, { ...c, gain });
-    if (gain < lo) lo = gain;
-    if (gain > hi) hi = gain;
-  }
-  if (!byCell.size) { lo = 0; hi = 0; }
-  return { byCell, lo, hi, round, rounds };
+function valueAt(d, x, y) {
+  return d.values?.[y]?.[x] ?? 0;
 }
 
 const HEAT = () => [css("--heat-0"), css("--heat-1"), css("--heat-2"),
                     css("--heat-3"), css("--heat-4")];
 
-function heatColor(gain, lo, hi, stops) {
+function heatColor(v, lo, hi, stops) {
   // A flat field would otherwise paint every cell the top colour; keep it at
   // the bottom of the ramp so "nothing distinguishes these" reads as such.
   if (hi <= lo) return stops[0];
-  const t = (gain - lo) / (hi - lo);
+  const t = (v - lo) / (hi - lo);
   const seg = Math.min(stops.length - 2, Math.floor(t * (stops.length - 1)));
   return mix(stops[seg], stops[seg + 1], t * (stops.length - 1) - seg);
 }
@@ -632,7 +583,7 @@ function draw() {
   const d = state.data;
   if (!d) return;
 
-  const { byCell, lo, hi, round, rounds } = candidateMap(d);
+  const { cells, lo, hi, positives } = valueMap(d);
   const W = d.width, H = d.height;
   const dpr = window.devicePixelRatio || 1;
   const w = W * CELL + PAD * 2, h = H * CELL + PAD * 2;
@@ -645,11 +596,10 @@ function draw() {
 
   const C = {
     paper: css("--paper"), ink: css("--ink"), soft: css("--ink-soft"),
-    faint: css("--ink-faint"), seam: css("--seam"), best: css("--best"),
-    taken: css("--taken"),
+    faint: css("--ink-faint"), seam: css("--seam"), taken: css("--taken"),
     plains: css("--plains"), river: css("--river"), mountain: css("--mountain"),
     inked: css("--inked"), mine: css("--mine"), foe: css("--foe"),
-    neutral: css("--neutral"), town: css("--town"), accent: css("--accent"),
+    neutral: css("--neutral"), town: css("--town"),
   };
   const terrain = [C.plains, C.river, C.mountain];
   const stops = HEAT();
@@ -680,13 +630,13 @@ function draw() {
     }
   }
 
-  // Heatmap over the candidate cells. It is translucent so terrain artwork
-  // stays readable underneath; with flat colours underneath it is near-opaque,
-  // since there is nothing below worth showing through.
+  // The value map itself. It is translucent so terrain artwork stays readable
+  // underneath; with flat colours underneath it is near-opaque, since there is
+  // nothing below worth showing through.
   if (state.showHeat) {
     const anyArt = TILE_NAMES.some((n) => tiles[n]);
-    for (const c of byCell.values()) {
-      ctx.fillStyle = heatColor(c.gain, lo, hi, stops);
+    for (const c of cells) {
+      ctx.fillStyle = heatColor(c.v, lo, hi, stops);
       ctx.globalAlpha = anyArt ? 0.65 : 0.88;
       ctx.fillRect(px(c.x), py(c.y), CELL, CELL);
       ctx.globalAlpha = 1;
@@ -716,6 +666,34 @@ function draw() {
   ctx.strokeStyle = C.seam;
   ctx.lineWidth = 1;
   ctx.strokeRect(PAD, PAD, W * CELL, H * CELL);
+
+  // The region this turn disrupts, traced along its outer edge only -- an
+  // outline says "this whole shape" where a fill would bury the values that
+  // chose it.
+  if (d.decision.disrupt !== -1) {
+    const target = d.decision.disrupt;
+    ctx.strokeStyle = C.taken;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        if (d.regions[y][x] !== target) continue;
+        if (y === 0 || d.regions[y - 1][x] !== target) {
+          ctx.moveTo(px(x), py(y)); ctx.lineTo(px(x + 1), py(y));
+        }
+        if (y + 1 === H || d.regions[y + 1][x] !== target) {
+          ctx.moveTo(px(x), py(y + 1)); ctx.lineTo(px(x + 1), py(y + 1));
+        }
+        if (x === 0 || d.regions[y][x - 1] !== target) {
+          ctx.moveTo(px(x), py(y)); ctx.lineTo(px(x), py(y + 1));
+        }
+        if (x + 1 === W || d.regions[y][x + 1] !== target) {
+          ctx.moveTo(px(x + 1), py(y)); ctx.lineTo(px(x + 1), py(y + 1));
+        }
+      }
+    }
+    ctx.stroke();
+  }
 
   // rails
   const railColor = { 0: null, 1: null, 2: C.neutral };
@@ -768,84 +746,50 @@ function draw() {
     ctx.fillText(String(t.id), x + CELL / 2, y + CELL / 2 + 0.5);
   }
 
-  // candidate values
+  // The value in every cell that has one. Zeroes are left blank: they are the
+  // majority on a quiet board and printing them buries the field that matters.
   if (state.showNums) {
     ctx.font = '500 10px "JetBrains Mono", monospace';
     const onArt = TILE_NAMES.some((n) => tiles[n]);
-    for (const c of byCell.values()) {
+    for (const c of cells) {
+      if (c.v <= 0) continue;
       const cx = px(c.x) + CELL / 2, cy = py(c.y) + CELL / 2 + 0.5;
       // Over artwork the backdrop is unknown, so the number carries its own
       // outline; over flat colour the ink is simply chosen against the heat.
       if (onArt) {
         ctx.lineWidth = 2.5;
         ctx.strokeStyle = "rgb(0 0 0 / 0.75)";
-        ctx.strokeText(String(c.gain), cx, cy);
+        ctx.strokeText(String(c.v), cx, cy);
         ctx.fillStyle = "#ffffff";
       } else {
         ctx.fillStyle = state.showHeat
-          ? (c.gain > (lo + hi) / 2 ? "#ffffff" : "#1a1410")
+          ? (c.v > (lo + hi) / 2 ? "#ffffff" : "#1a1410")
           : C.soft;
       }
-      ctx.fillText(String(c.gain), cx, cy);
+      ctx.fillText(String(c.v), cx, cy);
     }
   }
 
-  // The rails already laid when this round ran: they are not candidates any
-  // more, they are the board this heatmap is scored against. Filled and
-  // numbered in order, so the prefix reads as a sequence.
-  const prefix = round?.prefix ?? [];
-  prefix.forEach((c, i) => {
-    ctx.fillStyle = C.accent;
-    ctx.fillRect(px(c.x) + 2, py(c.y) + 2, CELL - 4, CELL - 4);
-    ctx.font = '700 12px "JetBrains Mono", monospace';
-    ctx.fillStyle = C.paper;
-    ctx.fillText(String(i + 1), px(c.x) + CELL / 2, py(c.y) + CELL / 2 + 0.5);
-  });
-
-  // Two cells matter on a heatmap: the one it scored highest, and the one the
-  // search went on to take. Ringing the whole turn instead would mark cells
-  // this round never considered, and the two answers -- which is the question
-  // the page exists to put -- would be lost among them.
-  //
-  // Both rings are white, over a dark outline so they hold on any heat colour
-  // or artwork; when the two coincide a single ring is drawn, which is itself
-  // the answer.
-  // They land on different cells far more often than not, so a corner tick
-  // says which ring is which: top-left for the best score, bottom-right for
-  // the rail taken. A solid ring means the two agree.
-  const ring = (c, colour, corner) => {
+  // The rails played this turn, ringed and numbered in the order the planner
+  // chose them: the first is the top of the value map, the next ones the best
+  // it could still afford.
+  d.decision.cells.forEach((c, i) => {
     const x = px(c.x) + 1.75, y = py(c.y) + 1.75, s = CELL - 3.5;
     ctx.lineWidth = 3.5;
     ctx.strokeStyle = "rgb(0 0 0 / 0.55)";
     ctx.strokeRect(x, y, s, s);
     ctx.lineWidth = 2;
-    ctx.strokeStyle = colour;
+    ctx.strokeStyle = "#ffffff";
     ctx.strokeRect(x, y, s, s);
-    if (!corner) return;
-    ctx.fillStyle = colour;
-    const k = 5;
-    if (corner === "tl") ctx.fillRect(x - 1, y - 1, k, k);
-    else ctx.fillRect(x + s - k + 1, y + s - k + 1, k, k);
-  };
 
-  let top = null;
-  for (const c of byCell.values())
-    if (!top || c.gain > top.gain) top = c;
-
-  // The rail taken after this round's prefix, when it is known: only our own
-  // turn is printed, so the opponent's line has no such cell.
-  const taken = state.showFoe ? null : d.decision.cells[prefix.length] ?? null;
-  const agree = top && taken && taken.x === top.x && taken.y === top.y;
-
-  // One white ring when the search took its own best cell -- the two answers
-  // agree and there is nothing to compare. Otherwise they are set against each
-  // other: green on the cell that scored highest, red on the one taken.
-  if (agree) {
-    ring(top, "#ffffff", null);
-  } else {
-    if (top) ring(top, C.best, "tl");
-    if (taken) ring(taken, C.taken, "br");
-  }
+    // A corner badge rather than a centred number: the cell's own value is
+    // already printed in the middle, and that is what the ring is about.
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(x - 1, y - 1, 9, 9);
+    ctx.fillStyle = "#111111";
+    ctx.font = '700 8px "JetBrains Mono", monospace';
+    ctx.fillText(String(i + 1), x + 3.5, y + 4);
+  });
 
   // hovered cell
   if (state.hover) {
@@ -858,68 +802,36 @@ function draw() {
   // coordinate rulers, every fifth line
   ctx.font = '400 9px "JetBrains Mono", monospace';
   ctx.fillStyle = C.faint;
+  ctx.textAlign = "center";
   for (let x = 0; x < W; x += 5)
     ctx.fillText(String(x), px(x) + CELL / 2, PAD / 2 + 1);
   ctx.textAlign = "right";
   for (let y = 0; y < H; y += 5)
     ctx.fillText(String(y), PAD - 3, py(y) + CELL / 2);
 
-  drawSidebar(d, byCell, lo, hi, stops, round, rounds);
+  drawSidebar(d, lo, hi, stops, positives);
 }
 
 // ---- side rail ----
 
-// The turn's rails as a row of steps. Each one is a beam round, and picking
-// one shows the heatmap that round produced -- so the row walks the decision
-// forward, one rail at a time.
-function drawSteps(d, rounds, round) {
-  if (!rounds.length) {
-    ui.steps.innerHTML = "";
-    ui.stepNote.textContent = "aucun rail planifié ce tour.";
-    return;
-  }
-
-  ui.steps.innerHTML = rounds
-    .map((r, i) => {
-      const on = r === round;
-      const laid = r.prefix.length;
-      return `<button type="button" data-depth="${i}" aria-pressed="${on}"` +
-        ` title="${laid} coup${laid > 1 ? "s" : ""} déjà appliqué${
-          laid > 1 ? "s" : ""}">` +
-        `<b>rail ${i + 1}</b>${r.candidates.length} cases</button>`;
-    })
-    .join("");
-
-  for (const b of ui.steps.querySelectorAll("button"))
-    b.onclick = () => { state.depth = +b.dataset.depth; draw(); };
-
-  const laid = round?.prefix ?? [];
-  const cells = laid.map((c, i) => `<b>${i + 1}</b>&nbsp;${c.x},${c.y}`);
-  ui.stepNote.innerHTML = laid.length
-    ? `Posés avant : ${cells.join(" &nbsp;· ")}.<br>` +
-      `Les gains ci-dessous sont mesurés depuis ce plateau.`
-    : `Aucun coup appliqué : le plateau est celui du début du tour.`;
-}
-
-function drawSidebar(d, byCell, lo, hi, stops, round, rounds) {
-  drawSteps(d, rounds, round);
-
+function drawSidebar(d, lo, hi, stops, positives) {
   const inkedCount = d.regionInfo.filter((r) => r.inked).length;
   const unstable = d.regionInfo.filter((r) => r.instability > 0 && !r.inked);
   const mineRails = d.rails.flat().filter((v) => v === d.myId).length;
   const foeRails = d.rails.flat().filter((v) => v === 1 - d.myId).length;
+  // The referee names a wish from both of its towns; the dump deduplicates
+  // `active` but not `wishes`, so the pairs are canonicalised to match.
+  const wishCount = new Set(
+    d.wishes.map((w) => [Math.min(...w), Math.max(...w)].join("-"))).size;
 
   const rows = [
     ["tour", d.turn],
     ["score", `${d.scores.me} — ${d.scores.foe}`],
     ["mes rails", mineRails],
     ["rails adv.", foeRails],
-    ["wishes", d.wishes.length],
-    ["gap total (info)", d.baselineGap],
-    // The score the prefix this heatmap sits on already reached: zero on the
-    // first rail, since nothing has been laid yet.
-    ["score du prefix", round ? round.prefixGap : 0],
-    ["candidats", byCell.size],
+    ["wishes", `${(d.active ?? []).length} / ${wishCount} actives`],
+    ["cases valuées", positives],
+    ["valeur max", hi],
     ["régions inked", `${inkedCount} / ${d.regionInfo.length}`],
     ["instables", unstable.length],
   ];
@@ -927,65 +839,58 @@ function drawSidebar(d, byCell, lo, hi, stops, round, rounds) {
     .map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`)
     .join("");
 
-  // Top-scored cell against the cell played. When they disagree, the number
-  // the search maximised is not the number that chose the move -- which is
-  // the whole reason to look at this page.
+  // What the planner played, each cell with the value that got it picked --
+  // a turn read straight off the map above.
   const played = d.decision.cells;
-  let best = null;
-  for (const c of byCell.values())
-    if (!best || c.gain > best.gain) best = c;
+  ui.verdict.className = "verdict" + (played.length ? " acted" : "");
+  ui.verdict.innerHTML = [
+    played.length
+      ? played
+          .map((c, i) =>
+            `<b>${i + 1}</b> ${c.x},${c.y} → ${valueAt(d, c.x, c.y)}`)
+          .join("<br>")
+      : `<span class="note">WAIT — aucune case jouable valuée</span>`,
+    played.length
+      ? `<span class="note">${played.length} rail${
+          played.length > 1 ? "s" : ""}, ${d.decision.cost ?? "?"} peinture`
+        + `</span>`
+      : "",
+    d.decision.disrupt !== -1
+      ? `<b>disrupt</b> région ${d.decision.disrupt}`
+      : `<span class="note">aucun disrupt</span>`,
+  ].filter(Boolean).join("<br>");
 
-  if (!best) {
-    ui.verdict.className = "verdict";
-    ui.verdict.innerHTML = `<span class="note">aucun candidat ce tour</span>`;
-  } else {
-    // The rail this heatmap chose -- the one after the prefix, not always the
-    // first of the turn. Comparing the wrong rail would report a disagreement
-    // on every round but the first.
-    const n = round ? round.prefix.length : 0;
-    const picked = state.showFoe ? undefined : played[n];
-    const agrees = picked && picked.x === best.x && picked.y === best.y;
-    const pickedGain = picked
-      ? byCell.get(picked.y * 1000 + picked.x)?.gain
-      : undefined;
-    const ord = `${n + 1}${n ? "ᵉ" : "ᵉʳ"}`;
-    ui.verdict.className = "verdict" + (agrees ? " agree" : "");
-    ui.verdict.innerHTML = [
-      `<b>joué</b>  ${played.length
-        ? played.map((c, i) => (i === n ? `[${c.x},${c.y}]` : `${c.x},${c.y}`))
-            .join("  ")
-        : "WAIT"}`,
-      `<b>gain max</b>  ${best.x},${best.y} → ${best.gain}`,
-      picked === undefined
-        ? `<span class="note">${state.showFoe
-            ? "l'adversaire ne joue pas ici"
-            : "aucun rail joué à ce rang"}</span>`
-        : agrees
-        ? `<span class="note">le ${ord} rail est le maximum</span>`
-        : `<span class="note">${ord} rail joué → ${
-            pickedGain ?? "hors candidats"
-          }, écart ${
-            pickedGain === undefined ? "?" : best.gain - pickedGain
-          }</span>`,
-      d.decision.disrupt !== -1
-        ? `<b>disrupt</b>  région ${d.decision.disrupt}`
-        : "",
-    ].filter(Boolean).join("<br>");
-  }
+  // The regions the disrupt choice ranked: score is the opponent's rails in
+  // the region, valued by their cells, minus ours. Only an un-inked, town-free
+  // region can be hit, so the others are left out.
+  const eligible = d.regionInfo
+    .filter((r) => !r.inked && !r.hasTown && (r.disruptScore ?? 0) > 0)
+    .sort((a, b) => b.disruptScore - a.disruptScore)
+    .slice(0, 5);
+
+  ui.disrupts.innerHTML = eligible.length
+    ? eligible
+        .map((r) => {
+          const on = r.id === d.decision.disrupt;
+          const key = on ? `<b>région ${r.id}</b>` : `région ${r.id}`;
+          return `<dt>${key}</dt><dd>${r.disruptScore}` +
+            ` <span class="note">${r.instability}/${d.inkThreshold}</span></dd>`;
+        })
+        .join("")
+    : `<dt>—</dt><dd>aucune</dd>`;
+  ui.disruptNote.textContent = eligible.length
+    ? "Score = rails adverses − mes rails, chacun pesé par la valeur de sa case."
+    : "Aucune région encrable ne porte de rail adverse valué.";
 
   ui.ramp.innerHTML = stops
     .map((c) => `<span style="background:${c}"></span>`)
     .join("");
-  ui.rampLo.textContent = byCell.size ? lo : "—";
-  ui.rampHi.textContent = byCell.size ? hi : "—";
+  ui.rampLo.textContent = lo;
+  ui.rampHi.textContent = hi;
 
-  const who = state.showFoe ? "adversaire" : "moi";
-  const step = round
-    ? ` · rail ${round.depth + 1}/${rounds.length} ${who}`
-    : ` · ${who}`;
   ui.status.textContent =
     `tour ${d.turn} / ${state.turns.length ? state.turns.at(-1) : "?"}` +
-    ` · ${d.width}×${d.height}${step}`;
+    ` · ${d.width}×${d.height}`;
 }
 
 // ---- interaction ----
@@ -1009,9 +914,8 @@ cv.addEventListener("mousemove", (ev) => {
   if (!cell) { tip.hidden = true; if (changed) draw(); return; }
 
   const d = state.data;
-  const { byCell, round } = candidateMap(d);
-  const c = byCell.get(cell.y * 1000 + cell.x);
   const terrainName = ["plaine", "rivière", "montagne"][d.terrain[cell.y][cell.x]];
+  const cost = [1, 2, 3][d.terrain[cell.y][cell.x]] ?? "?";
   const region = d.regions[cell.y][cell.x];
   const info = d.regionInfo.find((r) => r.id === region);
   const owner = d.rails[cell.y][cell.x];
@@ -1025,7 +929,7 @@ cv.addEventListener("mousemove", (ev) => {
   // `wishes` field -- is what tells the whole story for this town.
   const town = d.towns.find((t) => t.x === cell.x && t.y === cell.y);
   const lines = [
-    `(${cell.x}, ${cell.y})  ${terrainName}`,
+    `(${cell.x}, ${cell.y})  ${terrainName} ${cost}`,
     `région ${region}   ${info ? info.instability : 0}/${d.inkThreshold}` +
       (info?.inked ? "  INKED" : ""),
   ];
@@ -1036,7 +940,7 @@ cv.addEventListener("mousemove", (ev) => {
       .filter((w) => w.includes(town.id))
       .map((w) => ({
         other: w[0] === town.id ? w[1] : w[0],
-        live: active.has(w.join("-")),
+        live: active.has([Math.min(...w), Math.max(...w)].join("-")),
       }))
       .sort((a, b) => a.other - b.other);
 
@@ -1055,9 +959,13 @@ cv.addEventListener("mousemove", (ev) => {
     lines.push(`rail    ${ownerName}`);
   }
 
-  const from = round ? round.prefixGap : 0;
-  lines.push(c ? `score   ${c.gap}  (prefix ${from})` : `score   —`);
-  lines.push(c ? `gain    ${c.gain}   coût ${c.cost}` : `non candidat`);
+  lines.push(`valeur  ${valueAt(d, cell.x, cell.y)}`);
+  if (info && !info.inked && !info.hasTown)
+    lines.push(`disrupt ${info.disruptScore ?? 0}  (région)`);
+
+  const rank = d.decision.cells.findIndex(
+    (c) => c.x === cell.x && c.y === cell.y);
+  if (rank >= 0) lines.push(`joué    rail ${rank + 1}`);
 
   tip.textContent = lines.join("\n");
   tip.hidden = false;
@@ -1076,8 +984,6 @@ async function go(n) {
   if (!state.turns.length) return;
   const lo = state.turns[0], hi = state.turns.at(-1);
   n = Math.max(lo, Math.min(hi, n));
-  // A turn's rails are its own, so the step selection restarts at the first.
-  state.depth = 0;
   try {
     await loadTurn(n);
     draw();
@@ -1100,12 +1006,6 @@ ui.next.onclick = () => go(state.turn + 1);
 ui.turn.onchange = () => go(parseInt(ui.turn.value, 10) || 1);
 ui.heat.onclick = () => toggle(ui.heat, "showHeat");
 ui.nums.onclick = () => toggle(ui.nums, "showNums");
-ui.owner.onchange = () => {
-  state.showFoe = ui.owner.value === "foe";
-  // The two players plan different lines, so their rounds do not correspond.
-  state.depth = 0;
-  draw();
-};
 
 ui.live.onclick = () => {
   const on = !state.liveTimer;
@@ -1127,16 +1027,6 @@ addEventListener("keydown", (ev) => {
   if (ev.key === "ArrowRight") { ev.preventDefault(); go(state.turn + 1); }
   if (ev.key === "h") ui.heat.click();
   if (ev.key === "n") ui.nums.click();
-  if (ev.key === "o") {
-    ui.owner.value = state.showFoe ? "me" : "foe";
-    ui.owner.onchange();
-  }
-  // 1-3 jump straight to a rail of the turn.
-  if (ev.key >= "1" && ev.key <= "3") {
-    const rounds = roundsFor(state.data ?? {});
-    const want = +ev.key - 1;
-    if (want < rounds.length) { state.depth = want; draw(); }
-  }
 });
 
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
