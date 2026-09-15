@@ -143,8 +143,35 @@ sont connectés — l'état dans lequel se passe ~75% d'une partie.
 
 ## Next steps
 
-- Refaire entierement l'heuristic du beam interne
-- Préferer les cells non encrable
+- Tester l'algorithm suivant en greedy first (meilleur combinaison) SANS beam search pour voir ce que ca vaut
+- Idées pour le pruning des actions légales du beam search :
+    1. Avantages :
+        - Priorizer les cases étant sur les chemins les plus courts entre des villes
+        - Parmis les connection souhaité, priorizer les connections les plus courtes
+        - Prioriser les cases qui sont sur plusieurs chemin les plus courts
+        - Prioriser les cases qui ne peuvent pas être supprimé
+        - Ecarter les cases qui vont se faire inked
+        Algorithme :
+        - Chaque main beam node doit re-construire les A* path les plus court entre les villes
+        - On repart de la lookup table static ayant les cases uninkable déjà rewarded
+        - Pour chaque A* path (Utiliser la récursivité pour ne pas avoir a stocker les coords ?) :
+            - On ajoute à toutes les case du path la valeur : w+h-pathLength
+        - Pour chaque cases, on multiple la valeur par : (5 - inkLevel) / 5 (CALCUL PROPRE AU PRUNING, l'heuristique devra en avoir un différent: Plus permisiffe)
+        - On considère uniquement les cases adjacentes aux rails et villes existants
+        - On utilise LA meilleur combinaisons comme actionset de l'adversaire
+        - On créé ~10 combinaisons parmis les meilleurs cases comme étant les actionset possible de la node actuel du BEAM SEARCH :
+            * En créant toutes les combinaisons des N meilleures cases ? (3 parmis 5) = 10 (Moins en réalité parce que on va des fois avoir que 1 ou 2 rails à poser)
+            * Aléatoirement parmis les N meilleurs ? = Plus de varièté et de création de chemins en parralle ?
+            Sachant que :
+                N=5  -> (3 parmis 5)  =  10 combinaisons
+                N=7  -> (3 parmis 7)  =  35 combinaisons
+                N=10 -> (3 parmis 10) = 120 combinaisons
+
+- Idées pour l'heuristic principale :
+  - Différence de score
+  - Nombre de connection active ! Osef parce que ca peut autant être bien pour ladversaire que pour moi
+  - sum de 0 ou x si le rail est dans une région inkable (Uninkable regions > inkable regions)
+  
 - Cache/incrementalize openGapTotal — the single highest-value change. It re-does a full multi-component flood-fill per node when consecutive nodes differ by only ~3 rails.
 <!-- - openGapTotal prends 1/2 du temps total.. Supprimer entierement et refaire le cache a* avec invalidation quand région supprimé. -->
 <!-- - Lister les endroits ou on fait des floodfill/a* et mettre en cache tout ça -->
@@ -301,7 +328,15 @@ même tour peuvent différer. Les valeurs de la heatmap, elles, sont stables :
 
 ## Versions
 
-### v2.5
+### v2.8
+
+Reduce main beam width and nested beam on future depths
+
+### v2.7
+
+Replace whish data strcuture by a uint64 bit mask
+
+### v2.6
 
 Sort indexes and corresponding evaluation instead of full beam nodes
 
