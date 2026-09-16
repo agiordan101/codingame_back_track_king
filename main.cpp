@@ -662,8 +662,9 @@ private:
     vector<int> candCell, candCost, candValue;
     vector<Combo> combos;
 
-    // Component id per cell for each side, relabelled once per disrupt
-    // candidate, and the explicit stack the flood fill runs on.
+    // Who each side can reach, one mark per cell: same mark, same network.
+    // Redone once per disrupt candidate, never per combination. Plus the
+    // explicit stack the sweep runs on.
     vector<int> compMine, compFoe;
     vector<int> floodStack;
 
@@ -889,14 +890,7 @@ private:
         for (int d = -1; d < (int)candidates.size() && !outOfTime; d++)
         {
             const int slot = (d < 0) ? -1 : candidates[d].second;
-            if (slot >= 0)
-                tallyCut(board, slot);
-
-            // The O(N) relabelling happens here, once per board, never per
-            // combination: that is what keeps thousands of them affordable.
-            buildComponents(board, foeId, slot, compFoe);
-            buildComponents(board, myId, slot, compMine);
-            const long long foeLinks = countLinks(compFoe);
+            const long long foeLinks = applyDisrupt(board, slot);
 
             for (const Combo &combo : combos)
             {
@@ -908,13 +902,9 @@ private:
                     outOfTime = true;
                     break;
                 }
-                const long long key = evaluate(combo, slot, foeLinks);
+                const long long key = scoreTurn(combo, slot, foeLinks);
                 evaluated++;
-                // A disrupt is free, so an equal board is reason enough to
-                // take one: the heuristic only sees the connection a cut
-                // breaks today, never the instability that inks it later.
-                // Candidates come best-scored first, so the first tie wins.
-                if (key > bestKey || (key == bestKey && slot >= 0 && bestSlot < 0))
+                if (isBetterTurn(key, bestKey, slot, bestSlot))
                 {
                     bestKey = key;
                     bestCombo = combo;
@@ -923,19 +913,53 @@ private:
             }
         }
 
-        for (int i = 0; i < bestCombo.n; i++)
+        applyRails(board, bestCombo, bestSlot, out);
+        if (bestSlot >= 0)
+            outDisrupt = board.stat->regions[bestSlot].id;
+    }
+
+    // Inks `slot` (-1 for no disrupt): every rail in that region is erased, on
+    // both sides, so each player's network is relabelled on the board the cut
+    // leaves behind. Returns what the opponent still connects afterwards --
+    // the only part of his score a turn of ours can move.
+    long long applyDisrupt(const Map &board, int slot)
+    {
+        if (slot >= 0)
+            tallyCut(board, slot);
+        // The O(N) relabelling happens here, once per board, never per
+        // combination: that is what keeps thousands of them affordable.
+        mapReachability(board, foeId, slot, compFoe);
+        mapReachability(board, myId, slot, compMine);
+        return countConnectedWishes(compFoe);
+    }
+
+    // Writes the winning combination out as the turn's rails. A rail in the
+    // region we ink is erased on the spot, so the scoring dropped it and the
+    // move must not carry it either.
+    void applyRails(const Map &board, const Combo &combo, int disruptSlot,
+                    ActionSet &out) const
+    {
+        for (int i = 0; i < combo.n; i++)
         {
-            const int idx = candCell[bestCombo.slot[i]];
-            // A rail laid in the region we then ink is erased on the spot, so
-            // the evaluation dropped it and the move must not carry it.
-            if (bestSlot >= 0 && cellSlot[idx] == bestSlot)
+            const int idx = candCell[combo.slot[i]];
+            if (disruptSlot >= 0 && cellSlot[idx] == disruptSlot)
                 continue;
             const int x = idx % W, y = idx / W;
             out.cells.push_back(Coord(x, y));
             out.cost += board.railCost(x, y);
         }
-        if (bestSlot >= 0)
-            outDisrupt = board.stat->regions[bestSlot].id;
+    }
+
+    // A disrupt is free, so an equal board is reason enough to take one: the
+    // score only sees the connection a cut breaks today, never the
+    // instability that inks the region later. Candidates come best-scored
+    // first, so the first to tie wins.
+    static bool isBetterTurn(long long key, long long bestKey, int slot,
+                             int bestSlot)
+    {
+        if (key != bestKey)
+            return key > bestKey;
+        return slot >= 0 && bestSlot < 0;
     }
 
     // The cells worth considering, ranked as the greedy ranked its first pick:
@@ -1067,12 +1091,13 @@ private:
         return changed;
     }
 
-    // ---- judging a board ----
+    // ---- scoring a turn ----
 
-    // Connections completed minus the opponent's, at SCORE_WEIGHT apiece, plus
-    // the value of the cells bought. The two never mix: no reachable sum of
-    // cell values comes near one connection.
-    long long evaluate(const Combo &combo, int banSlot, long long foeLinks) const
+    // The turn's points: connections we complete minus the opponent's, at
+    // SCORE_WEIGHT apiece, plus the value of the cells bought. The two never
+    // mix -- no reachable sum of cell values comes near one connection.
+    long long scoreTurn(const Combo &combo, int disruptSlot,
+                        long long foeLinks) const
     {
         int cells[3];
         int n = 0;
@@ -1081,24 +1106,26 @@ private:
         {
             const int idx = candCell[combo.slot[i]];
             // A rail laid in the region we then ink buys nothing at all.
-            if (banSlot >= 0 && cellSlot[idx] == banSlot)
+            if (disruptSlot >= 0 && cellSlot[idx] == disruptSlot)
                 continue;
             cells[n++] = idx;
             sum += candValue[combo.slot[i]];
         }
-        return (countMyLinks(cells, n) - foeLinks) * SCORE_WEIGHT + sum;
+        return (countMyWishesWith(cells, n) - foeLinks) * SCORE_WEIGHT + sum;
     }
 
-    // Labels each cell of player p's network with a component id, -1 outside
-    // it. A town is always in, whoever owns the rails around it; a region
-    // about to be inked is out, rails and all.
-    void buildComponents(const Map &board, int p, int banSlot, vector<int> &comp)
+    // Works out who a player can reach from where, once the disrupt has
+    // erased its region. Two towns are connected for him -- and so pay him --
+    // exactly when they come back with the same mark. Towns are always
+    // reachable, whoever owns the rails around them.
+    void mapReachability(const Map &board, int p, int disruptSlot,
+                         vector<int> &comp)
     {
         comp.assign(N, -1);
         int next = 0;
         for (int seed = 0; seed < N; seed++)
         {
-            if (comp[seed] != -1 || !inNetwork(board, p, seed, banSlot))
+            if (comp[seed] != -1 || !inNetwork(board, p, seed, disruptSlot))
                 continue;
             const int id = next++;
             comp[seed] = id;
@@ -1115,7 +1142,7 @@ private:
                     if (nx < 0 || nx >= W || ny < 0 || ny >= H)
                         continue;
                     const int nIdx = ny * W + nx;
-                    if (comp[nIdx] != -1 || !inNetwork(board, p, nIdx, banSlot))
+                    if (comp[nIdx] != -1 || !inNetwork(board, p, nIdx, disruptSlot))
                         continue;
                     comp[nIdx] = id;
                     floodStack.push_back(nIdx);
@@ -1124,17 +1151,18 @@ private:
         }
     }
 
-    bool inNetwork(const Map &board, int p, int idx, int banSlot) const
+    bool inNetwork(const Map &board, int p, int idx, int disruptSlot) const
     {
-        if (banSlot >= 0 && cellSlot[idx] == banSlot)
+        if (disruptSlot >= 0 && cellSlot[idx] == disruptSlot)
             return false;
         if (board.stat->townCellFlag[idx])
             return true;
         return board.grid.tiles[idx].tracksOwner == p;
     }
 
-    // Wishes both of whose towns sit in one component of `comp`.
-    int countLinks(const vector<int> &comp) const
+    // Wishes both of whose towns sit in one component of `comp`, i.e. the
+    // connections that player actually holds and is paid for.
+    int countConnectedWishes(const vector<int> &comp) const
     {
         int total = 0;
         for (const auto &link : links)
@@ -1147,10 +1175,11 @@ private:
         return total;
     }
 
-    // Our connections once `cells` are added to compMine. A union-find over
-    // just the new cells and the components they touch -- at most fifteen
-    // nodes on the stack -- so adding rails never costs a pass over the board.
-    int countMyLinks(const int *cells, int n) const
+    // The connections we would hold with `cells` laid on top of our network.
+    // A union-find over just the new cells and the components they touch --
+    // at most fifteen nodes, on the stack -- so trying a combination never
+    // costs a pass over the board.
+    int countMyWishesWith(const int *cells, int n) const
     {
         int parent[16], compOf[16];
         int cnt = n;

@@ -235,6 +235,7 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
+- Moins punir les cases inked
 - Use partOfActiveConnections:
   Une chaîne de paires townId séparées par des virgules indiquant que cette case fait partie d’une connexion active entre ces deux villes.
   ex. " 1-2,1-3,4-7 ": la case fait partie du chemin le plus court entre les villes 1 & 2, villes 1 & 3, et villes 4 & 7.
