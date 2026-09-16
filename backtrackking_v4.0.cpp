@@ -530,8 +530,6 @@ public:
     int myId = 0, foeId = 1;
     // When the search must stop. Set by Game from the turn's parse time.
     std::chrono::steady_clock::time_point deadline;
-    // Action sets the last turn actually scored, reported to stderr.
-    int evaluated = 0;
 
     // Board geometry and the layer that never changes: the uninkable bonus.
     // Also resolves each wish to a pair of coordinates, oriented from the town
@@ -881,8 +879,8 @@ private:
         long long bestKey = LLONG_MIN;
         Combo bestCombo{0, 0, {0, 0, 0}};
         int bestSlot = -1;
+        int checked = 0;
         bool outOfTime = false;
-        evaluated = 0;
 
         // -1 is the no-disrupt board, and it comes first so a turn that runs
         // out of clock still holds a move it has actually evaluated.
@@ -902,14 +900,13 @@ private:
             {
                 // The clock is read once a block: steady_clock::now() costs
                 // more than the evaluation it guards.
-                if (evaluated > 0 && (evaluated & 63) == 0 &&
+                if ((++checked & 63) == 0 &&
                     std::chrono::steady_clock::now() >= deadline)
                 {
                     outOfTime = true;
                     break;
                 }
                 const long long key = evaluate(combo, slot, foeLinks);
-                evaluated++;
                 // A disrupt is free, so an equal board is reason enough to
                 // take one: the heuristic only sees the connection a cut
                 // breaks today, never the instability that inks it later.
@@ -1302,14 +1299,12 @@ public:
 
     void parse()
     {
-        // The first read blocks until the referee writes the turn, so it
-        // returns about when the turn's clock started. Reading the board is
-        // part of the budget, hence the mark here rather than after it.
         cin >> myScore;
-        turnStart = std::chrono::steady_clock::now();
         cin >> foeScore;
         activeConnections.clear();
         gameMap.readTurnState(cin, activeConnections);
+
+        turnStart = std::chrono::steady_clock::now();
     }
 
     void gameTurn()
@@ -1318,6 +1313,8 @@ public:
 
         ActionSet action;
         int disrupt = -1;
+        // Counted from the parse, not from here: the referee's clock started
+        // when it wrote the turn, and reading the board is part of the turn.
         planner.deadline =
             turnStart + std::chrono::milliseconds(PLAN_BUDGET_MS);
         planner.plan(gameMap, action, disrupt);
@@ -1356,11 +1353,8 @@ public:
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - turnStart)
                 .count();
-        fprintf(stderr,
-                "turn : %lld us / %d ms  %d actionsets  %d rails (%d paint)  "
-                "disrupt %d\n",
-                us, PLAN_BUDGET_MS, planner.evaluated,
-                (int)action.cells.size(), action.cost, disrupt);
+        fprintf(stderr, "planner : %lld us  %d rails (%d paint)  disrupt %d\n",
+                us, (int)action.cells.size(), action.cost, disrupt);
     }
 };
 

@@ -4,11 +4,13 @@ CodinGame Summer Challenge 2026
 
 ## Chosen algorithm
 
-### Greedy value map (v3.0)
+### Recherche sur combinaisons (v4.0)
 
-Pas de recherche. Chaque tour le plateau est noté une fois, case par case, et
-les rails vont sur les meilleures cases que la peinture permet. ~100 µs par
-tour, contre 30 ms pour le beam.
+Le plateau est noté une fois, case par case, comme avant. Mais le coup n'est
+plus les meilleures cases prises une par une : **toutes les combinaisons de
+rails que la peinture permet** sont jouées contre **tous les DISRUPT
+candidats**, et la combinaison dont le plateau résultant note le mieux est le
+tour. ~0,6 ms par tour (max 1,5 ms) pour un budget de 30 ms.
 
 #### Ce qui compose la valeur d'une case
 
@@ -22,7 +24,10 @@ Tout ce qui entre dans le nombre affiché par le viewer, dans l'ordre du calcul 
 | 4 | **diffusion** | `+` moitié de chaque voisine valuée, sommée | uniquement sur les cases restées à 0, et seulement s'il reste de la peinture sans case à acheter |
 
 Le terme 2 est le moteur : une liaison courte vaut plus qu'une longue, parce
-que c'est celle qu'un tour peut finir. Le terme 3 n'est jamais divisé par 5 —
+que c'est celle qu'un tour peut finir. « Courte » se compte **en peinture, pas
+en cases** : l'arbitre note bien une liaison au nombre de cases, mais ce A*
+choisit où dépenser nos 3 points du tour, et une montagne en coûte vraiment 3.
+Mesurer l'inverse a coûté 20 points de winrate (v3.11, abandonnée). Le terme 3 n'est jamais divisé par 5 —
 le diviseur est commun à toutes les cases, le supprimer garde le classement
 intact et les valeurs entières.
 
@@ -30,15 +35,36 @@ intact et les valeurs entières.
 
 L'égalité est le cas normal : un chemin récompense toutes ses cases à
 l'identique. Une clé 64 bits les classe d'un seul entier
-(`value << 23 | réseau << 22 | (3−coût) << 20 | (N−1−idx)`) :
+(`value << 23 | réseau << 22 | (3−coût) << 20 | (N−1−idx)`). Depuis v4.0 elle
+ne choisit plus le coup : elle **retient les 24 candidates** que la recherche
+combine, et c'est l'heuristique qui tranche entre elles.
 
 1. **valeur** ;
-2. **adjacence au réseau** — rail ou ville voisine, y compris un rail posé plus
-   tôt dans le même tour. C'est ce qui construit une *ligne* au lieu de semer
+2. **adjacence au réseau** — rail ou ville voisine, sur le plateau tel qu'il
+   est en début de tour. C'est ce qui construit une *ligne* au lieu de semer
    des rails le long du couloir ;
 3. **terrain le moins cher** — à valeur égale, une plaine laisse deux rails de
    plus dans le tour qu'une montagne ;
 4. **ordre de balayage**, pour rester déterministe.
+
+**Le point 2 est plus faible qu'en v3.10, sciemment.** Le greedy reclassait
+entre chaque rail, `placed` en main : le 2ᵉ rail voyait le 1ᵉʳ comme du réseau,
+le 3ᵉ voyait les deux. La recherche doit énumérer avant d'évaluer, donc le
+classement est fait une fois pour toutes sur le plateau de début de tour
+(`touchesNetwork(board, none, …)`) et aucune candidate ne voit les autres.
+L'heuristique ne rattrape la contiguïté que lorsqu'elle **termine une
+liaison** : trois rails alignés qui n'en terminent aucune notent autant que
+trois rails éparpillés de même valeur.
+
+Mesuré sur une partie de 100 tours : **39 % des rails d'un tour touchent un
+autre rail du même tour, contre 42 % en v3.10**. L'écart est faible parce que
+la recherche pose plus de rails (236 contre 218 sur ces tours) — elle voit les
+combinaisons de coûts qui tiennent dans 3 peintures, là où le greedy
+s'enfermait en prenant une montagne à 3 en premier.
+
+Piste si on veut le rétablir : compter l'adjacence **interne à la combinaison**
+à l'évaluation, sous la somme des valeurs. Les voisins des cases neuves sont
+déjà parcourus par `countMyLinks`, donc ça ne coûte presque rien.
 
 #### Le tour, de bout en bout
 
@@ -49,9 +75,32 @@ l'identique. Une clé 64 bits les classe d'un seul entier
 3. **DISRUPT** — avant la remise d'encre, qui est une question de placement,
    pas de cible.
 4. Remise d'encre.
-5. Jusqu'à 3 rails, un balayage chacun : le deuxième est choisi en sachant le
-   premier.
-6. Diffusion si la peinture reste inemployée, puis retour en 5.
+5. Les 24 meilleures cases sont retenues, puis **toutes** leurs combinaisons
+   de coût ≤ 3 (l'ensemble vide compris : un tour peut ne valoir qu'un
+   DISRUPT), triées par somme de valeurs décroissante.
+6. Diffusion si aucune case n'est valuée, puis retour en 5.
+7. Chaque combinaison est évaluée contre le plateau sans DISRUPT puis contre
+   les 4 meilleures régions ; la meilleure clé gagne.
+
+#### L'heuristique
+
+`différence de score × 10000 + somme des valeurs des cases choisies`
+
+La différence de score compte les **wishes effectivement reliés** : deux villes
+dans la même composante connexe de mon réseau (rails à moi + villes). Une
+liaison terminée vaut donc plus que n'importe quelle somme de valeurs de cases,
+et les deux termes ne se mélangent jamais.
+
+Un rail posé dans la région qu'on encre le même tour est effacé aussitôt : il
+est retiré de la connectivité **et** de la somme.
+
+**Le coût, et pourquoi il tient dans le budget.** Recalculer la connectivité
+par combinaison serait un flood fill O(N) sur ~2350 × 5 combinaisons. À la
+place le flood fill tourne **une fois par plateau de DISRUPT** (5 fois par
+tour) et étiquette les composantes ; chaque combinaison n'unit ensuite que ses
+≤ 3 cases neuves avec les ≤ 12 composantes qu'elles touchent, dans un
+union-find de 16 entrées tenu sur la pile. Ajouter des rails ne coûte jamais
+un passage sur le plateau.
 
 #### Le choix du DISRUPT
 
@@ -63,10 +112,17 @@ Le score se lit sur **une copie diffusée** (`disruptValue`), jamais sur
 chemins de même longueur, donc l'adversaire construit *à côté* et pèse zéro
 sur la carte brute. Un anneau de diffusion est ce qui fait compter ses rails.
 
-Depuis v3.10, les candidats sont **classés** et le premier acceptable est joué :
-encrer une région tue toutes les connexions actives qui la traversent, donc la
-coupe est refusée si elle me coûte plus de rails qu'à l'adversaire, comptés sur
-toute la longueur des connexions touchées. Égalité acceptée.
+Depuis v4.0 le score par région ne fait plus que **classer** les candidats : ce
+sont les 4 meilleurs que la recherche joue réellement, et c'est l'heuristique
+qui tranche. Le veto de v3.10 a disparu parce qu'il est devenu redondant —
+compter les connexions qu'une coupe brise vraiment *est* ce veto, fait
+exactement plutôt que par approximation.
+
+**Un DISRUPT est gratuit**, donc il est pris dès que le plateau est *à égalité*
+— jamais au-dessus d'un vrai gain de score. Sans cette règle v4.0 jouait
+**0 DISRUPT par partie** contre 88 pour v3.10 : l'heuristique ne voit que la
+connexion coupée aujourd'hui, jamais l'instabilité qui encrera la région plus
+tard.
 
 #### Trois règles apprises à la dure
 
@@ -179,15 +235,12 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
-- La A* ne doit PAS prendre en compte le coup de peinture! Sinon l'adversaire peut créer des chemins plus court que nous :
-![alt text](image-3.png)
-
 - Use partOfActiveConnections:
   Une chaîne de paires townId séparées par des virgules indiquant que cette case fait partie d’une connexion active entre ces deux villes.
   ex. " 1-2,1-3,4-7 ": la case fait partie du chemin le plus court entre les villes 1 & 2, villes 1 & 3, et villes 4 & 7.
   " x " si cette case ne fait partie d’aucune connexion active.
 
-## Idées pour le prochain algorithm
+## Idées pour le prochain algorithm : Beam search with pruning algorithm and heuristic
 
 Lorsqu'on mettra un beam search par dessus, on pourrait faire des depth entre les tours pour choisir quelle région à disrupt parmis les 3 meilleurs.
 
@@ -221,6 +274,26 @@ comparaisons qu'on veut faire.
 Le bon protocole : **les deux candidats contre un même adversaire tiers**, et
 on compare les deux taux.
 
+**Mais le nul n'est un risque que si les deux versions se ressemblent.** Le
+diagnostic est le **nombre de nulles**, pas le principe du duel : v4.0 contre
+v3.10 en a rendu **1 sur 600**, là où deux quasi-jumeaux en rendaient 636 sur
+930. Quand les deux bots jouent vraiment différemment, le duel direct est
+valide — et c'est lui qui renseigne.
+
+**v3.1 est saturé, ne plus s'en servir pour départager.** Les trois versions
+ci-dessous sont indiscernables face à lui :
+
+| candidat | contre v3.1 |
+|---|---|
+| v3.4 | 96,7 % (94,9–97,8) |
+| v3.10 | 96,8 % (95,1–97,9) |
+| v4.0 | 96,7 % (94,9–97,8) |
+
+Or v4.0 bat v3.10 à **78,7 %** en direct. À ~97 % il ne reste qu'une vingtaine
+de parties pour discriminer : l'intervalle de confiance est plus large que
+l'écart qu'on cherche. Mesurer **contre la version en place**, et n'utiliser un
+tiers que si les nulles montent.
+
 ```sh
 cg-colosseum compare <candidat>  v3.1 -n 300 -s -t 8 --no-log
 cg-colosseum compare <reference> v3.1 -n 300 -s -t 8 --no-log
@@ -231,6 +304,38 @@ sans nulles du côté opposé, veut dire que la mesure est cassée, pas que le b
 l'est.
 
 ## Versions
+
+### v4.0
+
+Remplace le greedy par une **recherche sur combinaisons**. Toutes les
+combinaisons de rails de coût ≤ 3 tirées des 24 meilleures cases, contre le
+plateau sans DISRUPT et les 4 meilleures régions ; heuristique
+`différence de score × 10000 + somme des valeurs`.
+
+**78,7 % contre v3.10** (75,2–81,8 %, 600 games) — premier gain net depuis
+v3.4. Le greedy posait 229 rails par partie, la recherche 246, et 38 tours sur
+100 changent de jeu de rails.
+
+Le veto de v3.10 est supprimé (redondant avec la différence de score). Une
+règle a dû être ajoutée : prendre un DISRUPT à égalité de plateau, sans quoi
+l'heuristique un-tour n'en joue aucun.
+
+Last moment in arena: -
+
+First moment in arena: -
+
+### v3.11 — abandonnée (significativement pire)
+
+Le A* ne pondérait plus les cases par leur coût de peinture : chaque case
+passable coûtait 1, au motif que l'arbitre note une liaison au **nombre de
+cases**. Divergence bien réelle (3775 paires hors jeu : 84,5 % des trajets
+changent, 20,3 % étaient plus longs que nécessaire en cases, 2,6 cases de
+moyenne), mais **29,8 % de winrate contre v3.10** (26,3–33,6 %, 600 games).
+
+Leçon : ce A* ne prédit pas le score de l'adversaire, il décide où poser notre
+peinture. Un chemin court en cases qui franchit deux montagnes coûte deux tours
+pleins — le coût terrain était donc le bon critère pour la question réellement
+tranchée ici : quel tracé on a les moyens de finir.
 
 ### v3.10
 
