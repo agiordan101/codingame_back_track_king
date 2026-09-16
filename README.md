@@ -98,21 +98,6 @@ bâtis bien avant la fin du temps : sans elle, sur une partie gagnée 5116-1575,
 
 ### Critiques de l'algorithme
 
-- **Le classement ignore le prix.** Une montagne à 100 bat trois plaines à 90,
-  alors que les trois plaines valent 270 pour la même peinture. Trier sur
-  `valeur / coût` (ou faire un vrai sac à dos sur 3 points de peinture, ce qui
-  est trivial à cette taille) est le changement le plus rentable à essayer.
-- **Les chemins A* ignorent les rails déjà posés.** Une liaison déjà active
-  par un autre tracé continue d'attirer des rails sur son chemin *théorique*,
-  qui ne sert plus à rien. Donner un coût 0 aux cases déjà railées ferait
-  fondre la récompense sur le travail restant — et ferait monter les liaisons
-  presque finies en tête, ce qui est exactement le bon réflexe.
-- **Rien ne regarde l'adversaire** en dehors du DISRUPT. Le beam simulait son
-  tour ; ici il peut prendre la case visée sans qu'on le voie venir.
-- **Un seul chemin par wish.** Deux tracés de même longueur existent souvent ;
-  n'en récompenser qu'un fixe arbitrairement le tracé. Récompenser toutes les
-  cases sur *un* plus court chemin (un double A* depuis chaque ville, garder
-  `dA + dB == distance`) donnerait un couloir plutôt qu'une ligne.
 - **Le DISRUPT ne tient pas compte de l'instabilité déjà accumulée.** Une
   région à 3/4 est à un coup de l'encre, une région à 0/4 en demande quatre :
   à score égal la première vaut bien plus.
@@ -292,6 +277,27 @@ sans nulles du côté opposé, veut dire que la mesure est cassée, pas que le b
 l'est.
 
 ## Versions
+
+### v3.9 — abandonnée (non concluante)
+
+`partOfActiveConnections` agrégé par case en un simple compteur
+(`Map::activeConnCount`, rempli pendant le parsing existant), utilisé
+uniquement par `chooseDisrupt` : chaque rail y compte
+`valeur * (1 + 2 * traversées)`, des deux côtés de la soustraction — un rail
+actif rapporte à son propriétaire chaque tour, le nôtre autant.
+
+Mesuré contre v3.1 : **96,3 %** (94,6–97,6) contre **96,7 %** (94,9–97,8) pour
+v3.4. Intervalles quasi superposés, **aucun écart démontré**.
+
+Le signal est pourtant bien réel (vérifié sur log : 14 à 46 traversées par tour
+dès le tour 1). L'enseignement est donc sur le levier, pas sur l'implémentation :
+**changer la cible du DISRUPT ne déplace pas le résultat**. Le plafond est dans
+le placement des rails.
+
+Limite de mesure à retenir : à 96 % contre v3.1, il ne reste qu'une vingtaine de
+défaites pour départager deux candidats — le bruit domine. Départager mieux que
+v3.4 demanderait un adversaire tiers plus fort, et l'environnement n'en contient
+pas (v3.0 est plus faible, v3.5→v3.8 sont des régressions).
 
 ### v3.8 — abandonnée
 
