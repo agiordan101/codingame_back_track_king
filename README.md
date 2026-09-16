@@ -6,101 +6,83 @@ CodinGame Summer Challenge 2026
 
 ### Greedy value map (v3.0)
 
-Pas de recherche du tout. Chaque tour, le plateau est noté une fois, case par
-case, et les rails vont sur les meilleures cases que la peinture permet. Un
-tour coûte ~100 µs au lieu des 30 ms du beam.
+Pas de recherche. Chaque tour le plateau est noté une fois, case par case, et
+les rails vont sur les meilleures cases que la peinture permet. ~100 µs par
+tour, contre 30 ms pour le beam.
 
-**Au début de la partie** (`Planner::init`)
+#### Ce qui compose la valeur d'une case
 
-- Un tableau plat `baseValue[cell]` : `(W+H)/4` si la région de la case
-  contient une ville, 0 sinon. Une région à ville ne peut jamais être encrée,
-  donc un rail posé là n'est jamais effacé. La valeur est calibrée au quart
-  d'une récompense de chemin : assez pour départager deux cases d'un même
-  chemin, pas assez pour en battre un.
-- Les wishes sont résolus une fois en paires de coordonnées, dédupliqués
-  (l'arbitre annonce chaque liaison depuis ses deux villes).
-- `cellSlot[cell]` : la région de chaque case, aplatie en `int16` — les
-  balayages par région n'ont ainsi jamais à repasser par `regionId`.
+Tout ce qui entre dans le nombre affiché par le viewer, dans l'ordre du calcul :
 
-**Chaque tour** (`Planner::plan`)
+| # | terme | effet | condition |
+|---|---|---|---|
+| 1 | **bonus région-à-ville** | `+ (W+H)/4` | la région contient une ville — elle ne peut jamais être encrée, le rail n'y sera jamais effacé |
+| 2 | **récompense de chemin** | `+ max(1, W+H − coût du chemin)`, **une fois par chemin** | la case est sur le plus court chemin d'un wish ; cumulatif si plusieurs s'y croisent |
+| 3 | **remise d'encre** | `× (5 − instabilité)` | par région, instabilité plafonnée à 4 : une région proche de l'encre porte des rails bientôt effacés |
+| 4 | **diffusion** | `+` moitié de chaque voisine valuée, sommée | uniquement sur les cases restées à 0, et seulement s'il reste de la peinture sans case à acheter |
 
-1. `value = baseValue` (une copie mémoire, même taille, pas de réallocation).
-2. Pour chaque wish, A* sur le terrain (encre infranchissable) **de la ville
-   demandeuse vers la ville souhaitée**, *active ou non*. Chaque case du chemin reçoit `W+H-coût`, donc les
-   liaisons courtes — les seules qu'un tour peut finir — pèsent le plus. Le
-   chemin n'est jamais stocké : on remonte la chaîne de parents depuis la
-   destination en ajoutant au passage.
-3. **DISRUPT** : un balayage linéaire somme, par région, `+value` sous un rail
-   adverse et `-value` sous un des miens. La meilleure région non encrée et
-   sans ville est la cible, ou aucune si le meilleur score est ≤ 0.
-   Le score se lit sur **une copie diffusée** (`disruptValue`), jamais sur
-   `value`. Le couloir fait une case de large et est arbitraire parmi les
-   chemins de même longueur : l'adversaire construit *à côté*, pas dessus, et
-   pèse donc zéro sur la carte brute. Un anneau de diffusion est ce qui fait
-   compter ses rails. La copie est ce qui garde ça hors du classement des
-   rails — voir plus bas.
-4. `value *= (INK_SCALE - instabilité)` par région. La division par
-   `INK_SCALE` de la formule `(5 - inkLevel) / 5` n'est jamais faite : elle est
-   la même pour toutes les cases, donc la supprimer laisse le classement
-   intact et garde les valeurs exactes en entier.
-5. **Rails** : jusqu'à trois tours de boucle, chacun un balayage linéaire qui
-   garde la meilleure case jouable et abordable. Le deuxième rail est donc
-   choisi en sachant le premier.
-6. **Diffusion** (`diffuseValues`), seulement quand le balayage ne trouve plus
-   rien à poser alors qu'il reste de la peinture : chaque case encore à zéro
-   prend **la moitié de chaque voisine valuée**, sommée — une case entre deux
-   voisines valuées reçoit donc les deux moitiés. La passe lit un instantané
-   et écrit dans `value`, donc une case remplie par la passe ne nourrit pas la
-   suivante *dans* la même passe : un appel = un anneau. On rappelle jusqu'à
-   trouver une case, et la division par deux tue le front dès qu'il passe sous
-   2, donc la boucle se termine seule. L'encre et l'infranchissable ne
-   conduisent rien : aucun rail ne peut y vivre.
+Le terme 2 est le moteur : une liaison courte vaut plus qu'une longue, parce
+que c'est celle qu'un tour peut finir. Le terme 3 n'est jamais divisé par 5 —
+le diviseur est commun à toutes les cases, le supprimer garde le classement
+intact et les valeurs entières.
 
-Le choix des rails se fait sur une clé 64 bits construite en place
-(`value << 23 | touche-le-réseau << 22 | (3-coût) << 20 | (N-1-idx)`), donc la
-comparaison du balayage est un seul entier.
+#### Ce qui départage deux cases de même valeur
 
-**Le sens du parcours compte.** L'A* départage ses égalités dans l'ordre
-NORTH, EAST, SOUTH, WEST (`DIR_X`/`DIR_Y`), en marchant *depuis la source* :
-la relaxation n'écrase un parent que sur une amélioration stricte
-(`ng >= gScore[nIdx]` saute), donc la première direction à atteindre une case
-au coût optimal la garde. Partir de B au lieu de A donne donc un autre couloir
-partout où plusieurs plus courts chemins existent — mesuré à **3,8 % des
-paires** sur terrain varié (0 % sur plaine uniforme, où le couloir est
-symétrique). D'où l'orientation conservée telle que l'arbitre l'annonce :
-`readTowns` émet `(ville demandeuse, ville voulue)`, et `init` ne trie plus la
-paire par id. Aucun wish n'est déclaré par ses deux villes — vérifié sur le
-plateau : 13 déclarations, 13 paires uniques, 0 mutuelle.
+L'égalité est le cas normal : un chemin récompense toutes ses cases à
+l'identique. Une clé 64 bits les classe d'un seul entier
+(`value << 23 | réseau << 22 | (3−coût) << 20 | (N−1−idx)`) :
 
-**L'égalité est le cas normal**, pas l'exception : un chemin récompense toutes
-ses cases à l'identique. Les départages, dans l'ordre :
+1. **valeur** ;
+2. **adjacence au réseau** — rail ou ville voisine, y compris un rail posé plus
+   tôt dans le même tour. C'est ce qui construit une *ligne* au lieu de semer
+   des rails le long du couloir ;
+3. **terrain le moins cher** — à valeur égale, une plaine laisse deux rails de
+   plus dans le tour qu'une montagne ;
+4. **ordre de balayage**, pour rester déterministe.
 
-1. **adjacent au réseau** (rail ou ville voisine, y compris un rail posé plus
-   tôt dans le même tour). C'est ce qui transforme une ligne de cases égales
-   en une ligne *construite* : sans lui le remplissage suivrait l'ordre de
-   balayage et fragmenterait le chemin.
-2. **terrain le moins cher** — à valeur égale, une plaine laisse deux rails de
-   plus dans le tour qu'une montagne.
-3. **ordre de balayage**, pour rester déterministe.
+#### Le tour, de bout en bout
 
-**Ne jamais diffuser la carte que les rails classent.** Essayé en v3.2 : une
-passe inconditionnelle sur `value` juste après `buildValueMap`. Le halo remonte
-une montagne collée au couloir au-dessus d'une plaine plus loin sur ce même
-couloir, et comme `bestCell` classe sur la valeur brute, **58 tours sur 100
-passaient les 3 peintures dans une seule montagne** (tour 5 : une case à 540
-pour 3 peintures, là où trois plaines valaient 1190). Résultat : 4 V – 116 D
-contre v3.1. La diffusion pour le DISRUPT doit donc se faire sur une copie.
+1. `value = baseValue` (copie mémoire, aucune réallocation).
+2. Un A* par wish, encre infranchissable, **de la ville demandeuse vers la
+   ville souhaitée**. Le chemin n'est jamais stocké : on remonte la chaîne de
+   parents en ajoutant la récompense au passage.
+3. **DISRUPT** — avant la remise d'encre, qui est une question de placement,
+   pas de cible.
+4. Remise d'encre.
+5. Jusqu'à 3 rails, un balayage chacun : le deuxième est choisi en sachant le
+   premier.
+6. Diffusion si la peinture reste inemployée, puis retour en 5.
 
-La diffusion est ce qui remplit la fin de partie. Les plus courts chemins sont
-bâtis bien avant la fin du temps : sans elle, sur une partie gagnée 5116-1575,
-**65 tours sur 100 étaient des `WAIT`** et le bot posait 86 rails. Avec, zéro
-`WAIT` et 190 rails, pour ~36 µs par tour.
+#### Le choix du DISRUPT
 
-### Critiques de l'algorithme
+Score par région = somme des `value` sous les rails adverses, moins ceux sous
+les miens. Régions encrées ou à ville exclues.
 
-- **Le DISRUPT ne tient pas compte de l'instabilité déjà accumulée.** Une
-  région à 3/4 est à un coup de l'encre, une région à 0/4 en demande quatre :
-  à score égal la première vaut bien plus.
+Le score se lit sur **une copie diffusée** (`disruptValue`), jamais sur
+`value` : le couloir fait une case de large et est arbitraire parmi les
+chemins de même longueur, donc l'adversaire construit *à côté* et pèse zéro
+sur la carte brute. Un anneau de diffusion est ce qui fait compter ses rails.
+
+Depuis v3.10, les candidats sont **classés** et le premier acceptable est joué :
+encrer une région tue toutes les connexions actives qui la traversent, donc la
+coupe est refusée si elle me coûte plus de rails qu'à l'adversaire, comptés sur
+toute la longueur des connexions touchées. Égalité acceptée.
+
+#### Trois règles apprises à la dure
+
+**Ne jamais diffuser la carte que les rails classent.** Essayé en v3.2 : le
+halo remonte une montagne collée au couloir au-dessus d'une plaine plus loin
+sur ce même couloir, et **58 tours sur 100 passaient les 3 peintures dans une
+seule montagne**. 4 V – 116 D contre v3.1. D'où la copie pour le DISRUPT.
+
+**Le sens du parcours compte.** L'A* départage NESW en marchant depuis la
+source, et ne réécrit un parent que sur une amélioration stricte : partir de B
+au lieu de A donne un autre couloir sur **3,8 % des paires**. D'où
+l'orientation de l'arbitre conservée telle quelle.
+
+**La diffusion remplit la fin de partie.** Les plus courts chemins sont bâtis
+bien avant la fin : sans elle, **65 tours sur 100 étaient des `WAIT`** et le
+bot posait 86 rails ; avec, zéro `WAIT` et 190 rails.
 
 ## Debug viewer
 
@@ -197,9 +179,8 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
-- Pondérer le score de DISRUPT par l'instabilité déjà accumulée.
-- Simuler le tour de l'adversaire avec le même planner (il est assez rapide
-  pour tourner deux fois) et éviter les cases qu'il va prendre.
+- La A* ne doit PAS prendre en compte le coup de peinture! Sinon l'adversaire peut créer des chemins plus court que nous :
+![alt text](image-3.png)
 
 - Use partOfActiveConnections:
   Une chaîne de paires townId séparées par des virgules indiquant que cette case fait partie d’une connexion active entre ces deux villes.
@@ -210,26 +191,12 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 Lorsqu'on mettra un beam search par dessus, on pourrait faire des depth entre les tours pour choisir quelle région à disrupt parmis les 3 meilleurs.
 
-## Historique — BEAM search (v2.x)
-
-Le code de ces versions est dans `backtrackking_v2.*.cpp`.
-
-Deux beam searches imbriqués : l'extérieur planifiait les tours à venir, et
-pour chacun de ses nœuds l'intérieur décidait les rails du tour une case à la
-fois. Les deux étaient interruptibles et jouaient la meilleure ligne trouvée
-quand le budget de 30 ms tombait.
-
-- **Création des placements** : toute case abordable touchant le réseau, notée
-  par ce qu'elle raccourcit des wishes restants (`extendManhattanGap`).
-- **Heuristique d'état** (`evaluate`) : revenu par tour, moins `GAP_PENALTY`
-  par case de gap restant, mesuré par un flood fill multi-source
-  (`openGapTotal`) qui lit où deux composantes se rencontrent.
-- **DISRUPT** : la région où l'adversaire possède le plus de rails de
-  connexion de plus que moi.
-
-Ce qui l'a fait abandonner : `openGapTotal` prenait la moitié du temps total
-et refaisait un flood fill complet par nœud alors que des nœuds consécutifs ne
-diffèrent que de ~3 rails ; et la profondeur atteinte restait faible.
+Faire une depth séciale pour les DISRUPT :
+- Pruning comme avant pour avoir les disruptPruningWidth meilleurs régions à supprimer
+- On obtient Bwidth x disruptPruningWidth états
+- Sur une copie de chaque état, supprimer entierement la région pour l'heuristic UNIQUEMENT
+- Appliquer l'heuristic pour choisir les Bwidth meilleurs état
+- ink de 1 sur chaque Bwidth vrai état
 
 ### Idées de l'époque encore valables
 
@@ -238,19 +205,6 @@ diffèrent que de ~3 rails ; et la profondeur atteinte restait faible.
   les chemins invalidés quand une région est encrée. `PathTable` faisait ça en
   v2.x ; le planner v3 recalcule tout, ce qui coûte moins cher que le cache à
   cette taille de plateau.
-- Pour le pruning des actions : prioriser les cases sur plusieurs plus courts
-  chemins, celles qui ne peuvent pas être encrées, écarter celles qui vont
-  l'être. C'est devenu la carte de valeurs de v3.
-
-### GA pour construire un graph pondéré — ne fonctionne pas
-
-Trouver la longueur des chemins les plus courts entre chaque ville, créer un
-graph pondéré, faire un GA qui coupe et crée des liaisons pour minimiser la
-distance totale.
-
-- Les chemins doivent pouvoir être liés n'importe où, pas que sur des villes.
-- Construire un graph global ne rapporte pas beaucoup de points par rapport à
-  faire plein de liaisons rapidement. Trop lent.
 
 ## Protocole de mesure
 
@@ -280,7 +234,11 @@ l'est.
 
 ### v3.10
 
-Vérifie que les région que l'on veut DISRUPT ne participe pas à des chemins qui me rapportent plus de points qu'à l'adversaire
+Vérifie que les région que l'on veut DISRUPT ne participent pas à des chemins qui me rapportent plus de points qu'à l'adversaire
+
+Last moment in arena: -
+
+First moment in arena: 315/1439 overall & Silver league
 
 ### v3.9 — abandonnée (non concluante)
 
@@ -325,9 +283,19 @@ portent la mémoire du tracé d'un tour sur l'autre.
 
 ### v3.4
 
+![alt text](image.png)
+
 L'A* part de la ville demandeuse, et non de celle au plus petit id. Le tri par
 id dans `init` annulait le départage NESW sur ~3,8 % des paires ; il ne
 dédupliquait rien, aucun wish n'étant déclaré deux fois.
+
+Last moment in arena: 354/1435 overall & Silver league
+
+First moment in arena: 801/1435 -> 354/1435 overall & Silver league
+
+Bronze submit: 99 WIN / 2 LOSES
+
+![alt text](image-2.png)
 
 ### v3.3
 
@@ -383,7 +351,8 @@ Try nested beam search heuristic improvments
 
 Infinite 'WAIT' turns bug resolved by finding the best non empty action when first beam depth is broken
 
-Last moment in arena: -
+Last moment in arena: 810/1435 overall & Bronze league
+
 First moment in arena: 676/1320 overall & Bronze league
 
 ### v2.1
@@ -392,6 +361,7 @@ Reduce time budget from 45ms to 30ms : No remaining timeouts
 But many games are lost because of infinite WAIT action trhown each turn...
 
 Last moment in arena: 708/1316 overall & Bronze league
+
 First moment in arena: 100/400 Bronze
 
 ### v2.0
@@ -411,6 +381,7 @@ interruptible, playing the best line found when the turn budget runs out.
     rails more than we do. Four disrupts ink a region and erase its rails.
 
 Last moment in arena: 230/450 Bronze
+
 First moment in arena: 191/558 Bronze
 
 ### v1.0
@@ -422,9 +393,11 @@ First moment in arena: 191/558 Bronze
     preferring the one closest to being inked / with the most rails
 
 Last moment in arena: 580/115 Bronze
+
 First moment in arena: 191/558 Bronze
 
 ### v0.2
 
 Last moment in arena: 320/558 Bronze
+
 First moment in arena: -
