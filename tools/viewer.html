@@ -263,6 +263,9 @@
   dt { color: var(--ink-soft); }
   dd { margin: 0; text-align: right; }
   dd .note { color: var(--ink-faint); }
+  /* A cut that would cost us more than the opponent: the region was ranked
+     but refused, which is the thing worth spotting in the list. */
+  dd .note.veto { color: var(--mine); }
   dt b { color: var(--ink); }
 
   /* Legend and ramp share the swatch, so it is defined once. */
@@ -873,13 +876,22 @@ function drawSidebar(d, lo, hi, stops, positives) {
         .map((r) => {
           const on = r.id === d.decision.disrupt;
           const key = on ? `<b>région ${r.id}</b>` : `région ${r.id}`;
+          // Rails at stake once the whole of each severed connection is
+          // counted. No tally means the ranking stopped before this region.
+          const cut = r.cutMine == null
+            ? ` <span class="note">non évaluée</span>`
+            : ` <span class="note ${r.cutMine > r.cutFoe ? "veto" : ""}">` +
+              `coupe ${r.cutFoe}⚔ / ${r.cutMine}☗</span>`;
           return `<dt>${key}</dt><dd>${r.disruptScore}` +
-            ` <span class="note">${r.instability}/${d.inkThreshold}</span></dd>`;
+            ` <span class="note">${r.instability}/${d.inkThreshold}</span>` +
+            cut + `</dd>`;
         })
         .join("")
     : `<dt>—</dt><dd>aucune</dd>`;
   ui.disruptNote.textContent = eligible.length
-    ? "Score = rails adverses − mes rails, chacun pesé par la valeur de sa case."
+    ? "Score = rails adverses − mes rails, pesés par la valeur de leur case. "
+      + "Coupe = rails portés par les connexions actives que l'encrage tuerait, "
+      + "sur toute leur longueur ; refusée si j'y perds plus que l'adversaire."
     : "Aucune région encrable ne porte de rail adverse valué.";
 
   ui.ramp.innerHTML = stops
@@ -960,8 +972,15 @@ cv.addEventListener("mousemove", (ev) => {
   }
 
   lines.push(`valeur  ${valueAt(d, cell.x, cell.y)}`);
-  if (info && !info.inked && !info.hasTown)
+  if (info && !info.inked && !info.hasTown) {
     lines.push(`disrupt ${info.disruptScore ?? 0}  (région)`);
+    if (info.cutMine == null) {
+      lines.push(`coupe   non évaluée`);
+    } else {
+      const verdict = info.cutFoe >= info.cutMine ? "ok" : "refusée";
+      lines.push(`coupe   adv ${info.cutFoe} / moi ${info.cutMine}  ${verdict}`);
+    }
+  }
 
   const rank = d.decision.cells.findIndex(
     (c) => c.x === cell.x && c.y === cell.y);

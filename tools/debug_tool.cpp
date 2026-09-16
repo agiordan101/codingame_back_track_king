@@ -42,6 +42,10 @@ public:
     // Per region slot, what inking it would be worth. Indexed by slot, which
     // write() resolves back to a region id through the StaticMap.
     vector<int> regionScore;
+    // Rails at stake on both sides for the regions cutIsWorthIt actually
+    // weighed, by slot. A region the ranking never reached has no entry, and
+    // the viewer shows null rather than a zero it could mistake for a verdict.
+    map<int, pair<int, int>> cutTally;
     ActionSet decision;
     int disrupt = -1;
     int myScore = 0, foeScore = 0;
@@ -57,12 +61,17 @@ public:
         haveBoard = true;
         values.clear();
         regionScore.clear();
+        cutTally.clear();
         decision = ActionSet();
         disrupt = -1;
     }
 
     void setValues(const vector<int> &v) { values = v; }
     void setRegionScores(const vector<int> &s) { regionScore = s; }
+    void addCutTally(int slot, int mine, int foe)
+    {
+        cutTally[slot] = {mine, foe};
+    }
 
     void endTurn(const ActionSet &action, int d)
     {
@@ -93,6 +102,12 @@ void dbgRegionScores(const vector<int> &scoreBySlot)
 {
     if (g_probe)
         g_probe->setRegionScores(scoreBySlot);
+}
+
+void dbgCutTally(int slot, int mine, int foe)
+{
+    if (g_probe)
+        g_probe->addCutTally(slot, mine, foe);
 }
 
 void dbgTurnEnd(const ActionSet &action, int disrupt)
@@ -210,7 +225,15 @@ void DebugProbe::write(const string &path) const
            << ", \"hasTown\": " << (r.hasTown ? "true" : "false")
            << ", \"cells\": " << r.coords.size()
            << ", \"disruptScore\": "
-           << (slot < (int)regionScore.size() ? regionScore[slot] : 0) << "}";
+           << (slot < (int)regionScore.size() ? regionScore[slot] : 0);
+        // Only the regions the disrupt ranking actually reached carry a tally.
+        const auto it = cutTally.find(slot);
+        if (it != cutTally.end())
+            os << ", \"cutMine\": " << it->second.first
+               << ", \"cutFoe\": " << it->second.second;
+        else
+            os << ", \"cutMine\": null, \"cutFoe\": null";
+        os << "}";
     }
     os << "\n  ],\n";
 

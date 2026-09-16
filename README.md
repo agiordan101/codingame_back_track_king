@@ -278,6 +278,10 @@ l'est.
 
 ## Versions
 
+### v3.10
+
+Vérifie que les région que l'on veut DISRUPT ne participe pas à des chemins qui me rapportent plus de points qu'à l'adversaire
+
 ### v3.9 — abandonnée (non concluante)
 
 `partOfActiveConnections` agrégé par case en un simple compteur
