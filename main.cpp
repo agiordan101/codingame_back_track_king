@@ -1,4 +1,4 @@
-// v4.0
+#define BOT_VERSION "4.0"
 
 // One-turn search. The board is still scored cell by cell, but the move is no
 // longer the best cells taken one at a time: every affordable combination of

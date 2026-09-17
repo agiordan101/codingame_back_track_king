@@ -1,3 +1,4 @@
+// BOT_VERSION comes from main.cpp, included below: one source of truth.
 // Debug harness for the Back Track King bot.
 //
 // It compiles the real engine -- main.cpp is included verbatim, DEBUG_TOOL
@@ -182,6 +183,7 @@ void DebugProbe::write(const string &path) const
 
     os << "{\n";
     os << "  \"turn\": " << turn << ",\n";
+    os << "  \"botVersion\": \"" << BOT_VERSION << "\",\n";
     os << "  \"myId\": " << myId << ",\n";
     os << "  \"width\": " << W << ",\n";
     os << "  \"height\": " << H << ",\n";

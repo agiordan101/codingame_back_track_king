@@ -380,6 +380,7 @@
       <button id="next" title="Tour suivant (→)">▶</button>
       <button id="heat" aria-pressed="true" title="Heatmap (h)">Heatmap</button>
       <button id="nums" aria-pressed="true" title="Valeurs (n)">Valeurs</button>
+      <button id="numsRail" aria-pressed="false" title="Masquer la valeur sous un rail (r)">Valeurs sans rails</button>
       <button id="live" aria-pressed="false" title="Recharge toutes les 2s">Live</button>
     </div>
   </header>
@@ -458,6 +459,7 @@ const ui = {
   next:    document.getElementById("next"),
   heat:    document.getElementById("heat"),
   nums:    document.getElementById("nums"),
+  numsRail: document.getElementById("numsRail"),
   live:    document.getElementById("live"),
   facts:   document.getElementById("facts"),
   verdict: document.getElementById("verdict"),
@@ -474,6 +476,7 @@ const state = {
   data: null,
   showHeat: true,
   showNums: true,
+  hideNumsOnRail: false,
   hover: null,
   liveTimer: null,
 };
@@ -539,12 +542,14 @@ function valueMap(d) {
       if (d.inked[y][x] || townAt.has(y * 1000 + x)) continue;
       const v = d.values?.[y]?.[x] ?? 0;
       cells.push({ x, y, v });
-      if (v < lo) lo = v;
+      // Zeroes are not painted, so they must not set the scale either: the
+      // gradient would start below anything on screen and crush the low end.
+      if (v > 0 && v < lo) lo = v;
       if (v > hi) hi = v;
       if (v > 0) positives++;
     }
   }
-  if (!cells.length) { lo = 0; hi = 0; }
+  if (!positives) { lo = 0; hi = 0; }
   return { cells, lo, hi, positives };
 }
 
@@ -639,6 +644,9 @@ function draw() {
   if (state.showHeat) {
     const anyArt = TILE_NAMES.some((n) => tiles[n]);
     for (const c of cells) {
+      // A zero is not a cold value, it is the absence of one: colouring it
+      // would claim the planner weighed the cell when it never reached it.
+      if (c.v <= 0) continue;
       ctx.fillStyle = heatColor(c.v, lo, hi, stops);
       ctx.globalAlpha = anyArt ? 0.65 : 0.88;
       ctx.fillRect(px(c.x), py(c.y), CELL, CELL);
@@ -756,6 +764,8 @@ function draw() {
     const onArt = TILE_NAMES.some((n) => tiles[n]);
     for (const c of cells) {
       if (c.v <= 0) continue;
+      // A rail is already drawn there, and the number sits under the dot.
+      if (state.hideNumsOnRail && d.rails[c.y][c.x] !== -1) continue;
       const cx = px(c.x) + CELL / 2, cy = py(c.y) + CELL / 2 + 0.5;
       // Over artwork the backdrop is unknown, so the number carries its own
       // outline; over flat colour the ink is simply chosen against the heat.
@@ -828,6 +838,7 @@ function drawSidebar(d, lo, hi, stops, positives) {
     d.wishes.map((w) => [Math.min(...w), Math.max(...w)].join("-"))).size;
 
   const rows = [
+    ["bot", d.botVersion ?? "?"],
     ["tour", d.turn],
     ["score", `${d.scores.me} — ${d.scores.foe}`],
     ["mes rails", mineRails],
@@ -1025,6 +1036,7 @@ ui.next.onclick = () => go(state.turn + 1);
 ui.turn.onchange = () => go(parseInt(ui.turn.value, 10) || 1);
 ui.heat.onclick = () => toggle(ui.heat, "showHeat");
 ui.nums.onclick = () => toggle(ui.nums, "showNums");
+ui.numsRail.onclick = () => toggle(ui.numsRail, "hideNumsOnRail");
 
 ui.live.onclick = () => {
   const on = !state.liveTimer;
@@ -1046,6 +1058,7 @@ addEventListener("keydown", (ev) => {
   if (ev.key === "ArrowRight") { ev.preventDefault(); go(state.turn + 1); }
   if (ev.key === "h") ui.heat.click();
   if (ev.key === "n") ui.nums.click();
+  if (ev.key === "r") ui.numsRail.click();
 });
 
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);

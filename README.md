@@ -6,15 +6,24 @@ CodinGame Summer Challenge 2026
 
 ### Recherche sur combinaisons (v4.0)
 
-Le plateau est noté une fois, case par case, comme avant. Mais le coup n'est
-plus les meilleures cases prises une par une : **toutes les combinaisons de
-rails que la peinture permet** sont jouées contre **tous les DISRUPT
-candidats**, et la combinaison dont le plateau résultant note le mieux est le
-tour. ~0,6 ms par tour (max 1,5 ms) pour un budget de 30 ms.
+Chaque tour, le bot note tout le plateau, puis essaie **tous les coups qu'il
+peut se payer** et garde celui qui laisse la meilleure position.
 
-#### Ce qui compose la valeur d'une case
+#### Les étapes du tour
 
-Tout ce qui entre dans le nombre affiché par le viewer, dans l'ordre du calcul :
+1. Noter chaque case du plateau : combien vaudrait un rail posé là.
+2. Repérer les régions où l'adversaire a le plus à perdre si on les encre.
+3. Baisser la note des cases dont la région est près d'être encrée — un rail
+   y vivrait peu.
+4. Retenir les meilleures cases, celles qui méritent qu'on y réfléchisse.
+5. En former tous les groupes de rails que les 3 peintures permettent
+   d'acheter, du plus prometteur au moins prometteur.
+6. Pour chaque groupe, et pour chaque région à encrer envisagée : imaginer le
+   plateau qui en résulterait.
+7. Noter ce plateau imaginé, et retenir le meilleur couple rails + encrage.
+8. Jouer ce couple.
+
+#### Ce qui compose la note d'une case
 
 | # | terme | effet | condition |
 |---|---|---|---|
@@ -27,102 +36,47 @@ Le terme 2 est le moteur : une liaison courte vaut plus qu'une longue, parce
 que c'est celle qu'un tour peut finir. « Courte » se compte **en peinture, pas
 en cases** : l'arbitre note bien une liaison au nombre de cases, mais ce A*
 choisit où dépenser nos 3 points du tour, et une montagne en coûte vraiment 3.
-Mesurer l'inverse a coûté 20 points de winrate (v3.11, abandonnée). Le terme 3 n'est jamais divisé par 5 —
-le diviseur est commun à toutes les cases, le supprimer garde le classement
-intact et les valeurs entières.
+Mesurer l'inverse a coûté 20 points de winrate (v3.11, abandonnée).
 
-#### Ce qui départage deux cases de même valeur
+#### Comment un plateau imaginé est noté
+
+`différence de liaisons × 10000 + somme des notes des cases achetées`
+
+Une liaison terminée vaut donc plus que n'importe quelle somme de notes : finir
+une liaison passe toujours avant accumuler du bon terrain. La différence se
+compte sur **les deux joueurs**, donc couper une liaison adverse rapporte
+autant qu'en finir une.
+
+C'est ce qui remplace le veto de v3.10 : une coupe qui casse plus de nos
+liaisons que des siennes se note mal toute seule, sans règle dédiée.
+
+**Un encrage est gratuit**, donc il est pris dès que le plateau est *à
+égalité* — jamais au-dessus d'un vrai gain. Sans cette règle v4.0 ne jouait
+**aucun encrage de la partie** : la note ne voit que la liaison coupée
+aujourd'hui, jamais l'instabilité qui encrera la région plus tard.
+
+#### Ce qui départage deux cases de même note
 
 L'égalité est le cas normal : un chemin récompense toutes ses cases à
-l'identique. Une clé 64 bits les classe d'un seul entier
-(`value << 23 | réseau << 22 | (3−coût) << 20 | (N−1−idx)`). Depuis v4.0 elle
-ne choisit plus le coup : elle **retient les 24 candidates** que la recherche
-combine, et c'est l'heuristique qui tranche entre elles.
+l'identique. Dans l'ordre : la note, puis l'adjacence au réseau déjà posé,
+puis le terrain le moins cher, puis l'ordre de balayage pour rester
+déterministe.
 
-1. **valeur** ;
-2. **adjacence au réseau** — rail ou ville voisine, sur le plateau tel qu'il
-   est en début de tour. C'est ce qui construit une *ligne* au lieu de semer
-   des rails le long du couloir ;
-3. **terrain le moins cher** — à valeur égale, une plaine laisse deux rails de
-   plus dans le tour qu'une montagne ;
-4. **ordre de balayage**, pour rester déterministe.
+**L'adjacence est plus faible qu'en v3.10, sciemment.** Le greedy reclassait
+entre chaque rail : le 2ᵉ voyait le 1ᵉʳ comme du réseau. La recherche doit
+former ses groupes avant de les juger, donc aucune case candidate ne voit les
+autres. La note ne rattrape la contiguïté que lorsqu'elle **termine une
+liaison** : trois rails alignés qui n'en terminent aucune valent autant que
+trois rails éparpillés de même note.
 
-**Le point 2 est plus faible qu'en v3.10, sciemment.** Le greedy reclassait
-entre chaque rail, `placed` en main : le 2ᵉ rail voyait le 1ᵉʳ comme du réseau,
-le 3ᵉ voyait les deux. La recherche doit énumérer avant d'évaluer, donc le
-classement est fait une fois pour toutes sur le plateau de début de tour
-(`touchesNetwork(board, none, …)`) et aucune candidate ne voit les autres.
-L'heuristique ne rattrape la contiguïté que lorsqu'elle **termine une
-liaison** : trois rails alignés qui n'en terminent aucune notent autant que
-trois rails éparpillés de même valeur.
+Mesuré sur 100 tours : **39 % des rails d'un tour touchent un autre rail du
+même tour, contre 42 % en v3.10**. L'écart est faible parce que la recherche
+pose plus de rails (236 contre 218) — elle voit les groupes qui tiennent dans
+3 peintures, là où le greedy s'enfermait en prenant une montagne à 3 en
+premier.
 
-Mesuré sur une partie de 100 tours : **39 % des rails d'un tour touchent un
-autre rail du même tour, contre 42 % en v3.10**. L'écart est faible parce que
-la recherche pose plus de rails (236 contre 218 sur ces tours) — elle voit les
-combinaisons de coûts qui tiennent dans 3 peintures, là où le greedy
-s'enfermait en prenant une montagne à 3 en premier.
-
-Piste si on veut le rétablir : compter l'adjacence **interne à la combinaison**
-à l'évaluation, sous la somme des valeurs. Les voisins des cases neuves sont
-déjà parcourus par `countMyLinks`, donc ça ne coûte presque rien.
-
-#### Le tour, de bout en bout
-
-1. `value = baseValue` (copie mémoire, aucune réallocation).
-2. Un A* par wish, encre infranchissable, **de la ville demandeuse vers la
-   ville souhaitée**. Le chemin n'est jamais stocké : on remonte la chaîne de
-   parents en ajoutant la récompense au passage.
-3. **DISRUPT** — avant la remise d'encre, qui est une question de placement,
-   pas de cible.
-4. Remise d'encre.
-5. Les 24 meilleures cases sont retenues, puis **toutes** leurs combinaisons
-   de coût ≤ 3 (l'ensemble vide compris : un tour peut ne valoir qu'un
-   DISRUPT), triées par somme de valeurs décroissante.
-6. Diffusion si aucune case n'est valuée, puis retour en 5.
-7. Chaque combinaison est évaluée contre le plateau sans DISRUPT puis contre
-   les 4 meilleures régions ; la meilleure clé gagne.
-
-#### L'heuristique
-
-`différence de score × 10000 + somme des valeurs des cases choisies`
-
-La différence de score compte les **wishes effectivement reliés** : deux villes
-dans la même composante connexe de mon réseau (rails à moi + villes). Une
-liaison terminée vaut donc plus que n'importe quelle somme de valeurs de cases,
-et les deux termes ne se mélangent jamais.
-
-Un rail posé dans la région qu'on encre le même tour est effacé aussitôt : il
-est retiré de la connectivité **et** de la somme.
-
-**Le coût, et pourquoi il tient dans le budget.** Recalculer la connectivité
-par combinaison serait un flood fill O(N) sur ~2350 × 5 combinaisons. À la
-place le flood fill tourne **une fois par plateau de DISRUPT** (5 fois par
-tour) et étiquette les composantes ; chaque combinaison n'unit ensuite que ses
-≤ 3 cases neuves avec les ≤ 12 composantes qu'elles touchent, dans un
-union-find de 16 entrées tenu sur la pile. Ajouter des rails ne coûte jamais
-un passage sur le plateau.
-
-#### Le choix du DISRUPT
-
-Score par région = somme des `value` sous les rails adverses, moins ceux sous
-les miens. Régions encrées ou à ville exclues.
-
-Le score se lit sur **une copie diffusée** (`disruptValue`), jamais sur
-`value` : le couloir fait une case de large et est arbitraire parmi les
-chemins de même longueur, donc l'adversaire construit *à côté* et pèse zéro
-sur la carte brute. Un anneau de diffusion est ce qui fait compter ses rails.
-
-Depuis v4.0 le score par région ne fait plus que **classer** les candidats : ce
-sont les 4 meilleurs que la recherche joue réellement, et c'est l'heuristique
-qui tranche. Le veto de v3.10 a disparu parce qu'il est devenu redondant —
-compter les connexions qu'une coupe brise vraiment *est* ce veto, fait
-exactement plutôt que par approximation.
-
-**Un DISRUPT est gratuit**, donc il est pris dès que le plateau est *à égalité*
-— jamais au-dessus d'un vrai gain de score. Sans cette règle v4.0 jouait
-**0 DISRUPT par partie** contre 88 pour v3.10 : l'heuristique ne voit que la
-connexion coupée aujourd'hui, jamais l'instabilité qui encrera la région plus
-tard.
+Piste pour le rétablir : compter l'adjacence interne au groupe au moment de
+noter, sous la somme des notes.
 
 #### Trois règles apprises à la dure
 
@@ -170,6 +124,27 @@ par une autre version du bot.
 make replay LOG=.colosseum/logs/firstenv/run-*/game_*_p0.events.jsonl
 make viewer     # puis http://localhost:8000
 ```
+
+### Observer un bot précis
+
+Jouer la partie en la logguant, rejouer le log, servir le viewer :
+
+```sh
+cg-colosseum battle v4.0 v3.10 -n 1 --seed 42 -l .colosseum/logs/v3_comp/mine
+make replay LOG=.colosseum/logs/v3_comp/mine/game_*_p0.events.jsonl
+make viewer
+```
+
+Chaque partie écrit **deux logs, un par joueur** : `_p0` est le premier bot
+cité, `_p1` le second. C'est ce suffixe qui choisit le bot observé, pas
+l'ordre des arguments de `replay`.
+
+Attention : le log ne contient que ce que l'arbitre a envoyé à ce joueur, et
+`make replay` le rejoue dans le `main.cpp` **compilé maintenant**. Pour voir
+jouer une ancienne version il faut donc aussi restaurer son `main.cpp` ;
+sinon on regarde la version courante rejouer les situations que l'ancienne a
+rencontrées — utile pour comparer deux versions sur les mêmes plateaux, mais
+c'est un autre usage.
 
 ### Commandes du Makefile
 
@@ -235,6 +210,10 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
+- diffusion : Ajouter 4 moitiés sur un case donne un score plus grand que les cases elles mêmes. Il faut ajouter 1/4 ? Est ce qu'on veut que ces cases puissent être meilleur que d'des principales a* ?
+- Est ce que le choix résultant des 24 meilleurs combinaisons tombe souvent sur les 3/4 premiers ?
+    - Si oui, alors on peut réduire la PRUNING_WIDTH à 10 -> OUI IL SEMBLERAIT. 
+    - Si non, alors il faudrait la laisser élevé
 - Moins punir les cases inked
 - Use partOfActiveConnections:
   Une chaîne de paires townId séparées par des virgules indiquant que cette case fait partie d’une connexion active entre ces deux villes.
@@ -243,14 +222,14 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées pour le prochain algorithm : Beam search with pruning algorithm and heuristic
 
-Lorsqu'on mettra un beam search par dessus, on pourrait faire des depth entre les tours pour choisir quelle région à disrupt parmis les 3 meilleurs.
-
-Faire une depth séciale pour les DISRUPT :
+Lorsqu'on mettra un beam search par dessus, on pourrait faire des depth entre les tours pour choisir quelle région à disrupt parmis les 3 meilleurs. Faire une depth séciale pour les DISRUPT :
 - Pruning comme avant pour avoir les disruptPruningWidth meilleurs régions à supprimer
 - On obtient Bwidth x disruptPruningWidth états
-- Sur une copie de chaque état, supprimer entierement la région pour l'heuristic UNIQUEMENT
+- Sur une copie de chaque état, supprimer entierement la région pour l'heuristic UNIQUEMENT (PROBLEME : ne favorise pas le passage de 4 à 5 par rapport de 0 à 1)
 - Appliquer l'heuristic pour choisir les Bwidth meilleurs état
 - ink de 1 sur chaque Bwidth vrai état
+
+On peut commencer avec PRUNING_WIDTH=10 (branching factor)
 
 ### Idées de l'époque encore valables
 
@@ -323,7 +302,7 @@ l'heuristique un-tour n'en joue aucun.
 
 Last moment in arena: -
 
-First moment in arena: -
+First moment in arena: 333/1439 overall & Silver league
 
 ### v3.11 — abandonnée (significativement pire)
 
@@ -342,7 +321,7 @@ tranchée ici : quel tracé on a les moyens de finir.
 
 Vérifie que les région que l'on veut DISRUPT ne participent pas à des chemins qui me rapportent plus de points qu'à l'adversaire
 
-Last moment in arena: -
+Last moment in arena: 412/1468 overall & Silver league
 
 First moment in arena: 315/1439 overall & Silver league
 
