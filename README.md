@@ -4,7 +4,7 @@ CodinGame Summer Challenge 2026
 
 ## Chosen algorithm
 
-### Recherche sur combinaisons (v4.0)
+### Recherche sur combinaisons (v4)
 
 Chaque tour, le bot note tout le plateau, puis essaie **tous les coups qu'il
 peut se payer** et garde celui qui laisse la meilleure position.
@@ -18,9 +18,9 @@ peut se payer** et garde celui qui laisse la meilleure position.
 4. Retenir les meilleures cases, celles qui méritent qu'on y réfléchisse.
 5. En former tous les groupes de rails que les 3 peintures permettent
    d'acheter, du plus prometteur au moins prometteur.
-6. Pour chaque groupe, et pour chaque région à encrer envisagée : imaginer le
-   plateau qui en résulterait.
-7. Noter ce plateau imaginé, et retenir le meilleur couple rails + encrage.
+6. Pour chaque groupe, et pour chaque région à encrer envisagée : appliquer la pose de rails et l'encrage des régions
+7. Mettre à jour les scrores 
+8. Noter ce plateau imaginé, et retenir le meilleur couple rails + encrage.
 8. Jouer ce couple.
 
 #### Ce qui compose la note d'une case

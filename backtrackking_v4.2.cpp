@@ -1,4 +1,4 @@
-#define BOT_VERSION "4.2"
+#define BOT_VERSION "4.0"
 
 // One-turn search. The board is still scored cell by cell, but the move is no
 // longer the best cells taken one at a time: every affordable combination of
@@ -57,7 +57,7 @@ static const int INK_SCALE = INK_INSTABILITY_THRESHOLD + 1;
 
 // Planning budget, counted from the moment the turn's input is parsed. The
 // referee allows 50 ms; the rest is left to parsing jitter and the reply.
-static const int PLAN_BUDGET_MS = 30;
+static const int PLAN_BUDGET_MS = 20;
 
 // Ranked cells the combination search draws from, and disrupt regions tried
 // alongside them. Together they bound the search at C(20,3) combinations
@@ -918,20 +918,15 @@ private:
         // out of clock still holds a move it has actually evaluated.
         for (int d = -1; d < (int)candidates.size() && !outOfTime; d++)
         {
-            // Laying out a disrupt board costs one solve per wish, so the
-            // clock is checked before committing to another one rather than
-            // only inside the loop it feeds.
-            if (d >= 0 && outOfBudget())
-                break;
             const int slot = (d < 0) ? -1 : candidates[d].second;
             applyDisrupt(board, slot);
 
             for (const Combo &combo : combos)
             {
-                // One state can cost a solve per wish, so the clock is read
-                // every few of them: a coarser stride overshoots the budget by
-                // more than the reads it saves.
-                if (evaluated > 0 && (evaluated & 7) == 0 && outOfBudget())
+                // The clock is read once a block: steady_clock::now() costs
+                // more than the evaluation it guards.
+                if (evaluated > 0 && (evaluated & 63) == 0 &&
+                    std::chrono::steady_clock::now() >= deadline)
                 {
                     outOfTime = true;
                     break;
@@ -961,13 +956,6 @@ private:
         if (slot >= 0)
             tallyCut(board, slot);
         baselineIncome(board, slot);
-    }
-
-    // The one place the turn's deadline is read. The budget is a hard limit:
-    // the search stops to meet it, it is never widened to fit the search.
-    bool outOfBudget() const
-    {
-        return std::chrono::steady_clock::now() >= deadline;
     }
 
     // Writes the winning combination out as the turn's rails. A rail in the
