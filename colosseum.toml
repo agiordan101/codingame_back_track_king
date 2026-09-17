@@ -1,5 +1,5 @@
 [project]
-environment = "v3_comp"
+environment = "v4_comp"
 preset = "summer2026"
 league = "bronze"
 # challenge = "summer2026"  # uncomment to link CG online stats

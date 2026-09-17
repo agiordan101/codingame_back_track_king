@@ -928,9 +928,9 @@ private:
 
             for (const Combo &combo : combos)
             {
-                // Read every single state. Measured: a stride of 8 saves 1.5%
-                // of the states scored and costs up to 8 ms of overshoot --
-                // the clock is not the bottleneck here, the wish solves are.
+                // Read every single state: one of them can cost a solve per
+                // wish, so any stride at all overshoots the budget by far more
+                // than the clock reads it saves.
                 if (evaluated > 0 && outOfBudget())
                 {
                     outOfTime = true;
