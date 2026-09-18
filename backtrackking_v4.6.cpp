@@ -1,4 +1,4 @@
-#define BOT_VERSION "4.5"
+#define BOT_VERSION "4.6"
 
 // One-turn search. The board is still scored cell by cell, but the move is no
 // longer the best cells taken one at a time: every affordable combination of
@@ -568,6 +568,7 @@ public:
         compFoe.assign(N, -1);
         bfsSeen.assign(N, 0);
         fresh.assign(N, 0);
+        foeMark.assign(N, 0);
         bfsParent.assign(N, -1);
         bfsQueue.reserve(N);
         floodStack.reserve(N);
@@ -686,6 +687,11 @@ private:
     // The combination's own cells, stamped once per state.
     vector<int> fresh;
     int freshStamp = 0;
+    // The rails we expect the opponent to lay this turn, stamped per cell so
+    // the hot loop tests one int: a cell both sides paint scores as the
+    // neutral it would become.
+    vector<int> foeMark;
+    int foeStamp = 0;
     // Per-wish baseline payout and the cells its sweep reached, for the
     // disrupt board being evaluated.
     long long baseMine = 0, baseFoe = 0;
@@ -907,6 +913,7 @@ private:
         while (candCell.empty() && diffuseValues(board))
             buildCandidates(board);
         buildCombos();
+        predictFoeRails();
 
         long long bestKey = LLONG_MIN;
         Combo bestCombo{0, 0, {0, 0, 0}};
@@ -928,9 +935,9 @@ private:
 
             for (const Combo &combo : combos)
             {
-                // Read every single state: one of them can cost a solve per
-                // wish, so any stride at all overshoots the budget by far more
-                // than the clock reads it saves.
+                // Read every single state. Measured: a stride of 8 saves 1.5%
+                // of the states scored and costs up to 8 ms of overshoot --
+                // the clock is not the bottleneck here, the wish solves are.
                 if (evaluated > 0 && outOfBudget())
                 {
                     outOfTime = true;
@@ -1044,6 +1051,20 @@ private:
             candCost.push_back(board.railCost(idx % W, idx / W));
             candValue.push_back(value[idx]);
         }
+    }
+
+    // The opponent prunes and ranks on the same value map we do -- it is
+    // symmetric, built from the towns' wishes, with no side in it -- so his
+    // move is the combination our own ordering puts first. Predicting it lets
+    // the scoring know which of our cells would end up neutral.
+    void predictFoeRails()
+    {
+        foeStamp++;
+        if (combos.empty())
+            return;
+        const Combo &best = combos.front();
+        for (int i = 0; i < best.n; i++)
+            foeMark[candCell[best.slot[i]]] = foeStamp;
     }
 
     // Every set of candidates the turn's paint can afford, richest first. The
@@ -1164,6 +1185,10 @@ private:
     {
         if (fresh[idx] == freshStamp)
             return true;
+        // His predicted rails are laid this turn too, so they carry paths and
+        // pay him -- ignoring them would misjudge every wish he is completing.
+        if (foeMark[idx] == foeStamp)
+            return disruptSlot < 0 || cellSlot[idx] != disruptSlot;
         if (disruptSlot >= 0 && cellSlot[idx] == disruptSlot)
             return false;
         if (board.stat->townCellFlag[idx])
@@ -1230,7 +1255,15 @@ private:
                 continue;
             if (fresh[cur] == freshStamp)
             {
-                mine++; // laid this turn, so ours
+                // Both players painting the same cell makes it neutral, and a
+                // neutral rail pays nobody. It still carries the path.
+                if (foeMark[cur] != foeStamp)
+                    mine++;
+                continue;
+            }
+            if (foeMark[cur] == foeStamp)
+            {
+                foe++; // his, unless we contested it -- handled above
                 continue;
             }
             const int owner = board.grid.tiles[cur].tracksOwner;

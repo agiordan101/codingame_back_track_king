@@ -40,15 +40,25 @@ Mesurer l'inverse a coûté 20 points de winrate (v3.11, abandonnée).
 
 #### Comment un plateau imaginé est noté
 
-`différence de liaisons × 10000 + somme des notes des cases achetées`
+`différence de score × 10000 + somme des notes des cases achetées`
 
-Une liaison terminée vaut donc plus que n'importe quelle somme de notes : finir
-une liaison passe toujours avant accumuler du bon terrain. La différence se
-compte sur **les deux joueurs**, donc couper une liaison adverse rapporte
-autant qu'en finir une.
+Le score, c'est celui de la partie — celui que l'arbitre a annoncé en début de
+tour — plus ce que le plateau imaginé rapporterait à la fin du tour.
 
-C'est ce qui remplace le veto de v3.10 : une coupe qui casse plus de nos
-liaisons que des siennes se note mal toute seule, sans règle dédiée.
+**Le revenu se recalcule, il ne se lit pas.** Chaque paire de villes qui se
+souhaitent est re-reliée sur le plateau d'après coup ; si un chemin existe, le
+plus court devient la connexion active et **chaque joueur touche 1 point par
+rail qu'il possède dessus**. Un rail qui achève une liaison rapporte donc dès
+ce tour, et une liaison que l'encrage a coupée cesse de rapporter — même
+coupée loin de la région encrée.
+
+Un point de revenu vaut plus que n'importe quelle somme de notes : gagner du
+score passe toujours avant accumuler du bon terrain. La différence se compte
+sur **les deux joueurs**, donc couper un revenu adverse vaut autant qu'en
+créer un.
+
+C'est ce qui remplace le veto de v3.10 : une coupe qui nous coûte plus de
+revenu qu'à l'adversaire se note mal toute seule, sans règle dédiée.
 
 **Un encrage est gratuit**, donc il est pris dès que le plateau est *à
 égalité* — jamais au-dessus d'un vrai gain. Sans cette règle v4.0 ne jouait
@@ -215,10 +225,11 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
     - Si oui, alors on peut réduire la PRUNING_WIDTH à 10 -> OUI IL SEMBLERAIT. 
     - Si non, alors il faudrait la laisser élevé
 - Moins punir les cases inked
-- Use partOfActiveConnections:
-  Une chaîne de paires townId séparées par des virgules indiquant que cette case fait partie d’une connexion active entre ces deux villes.
-  ex. " 1-2,1-3,4-7 ": la case fait partie du chemin le plus court entre les villes 1 & 2, villes 1 & 3, et villes 4 & 7.
-  " x " si cette case ne fait partie d’aucune connexion active.
+- Pruning — le plus gros levier. wishReach est un char par case par wish (17 × 442 = 7,5 Ko relus intégralement à chaque plateau). En bitset (uint64_t), c'est 56 octets par wish, et le test des 3 cases devient 3 lectures de bits. Surtout, baselineIncome fait deux passes O(N) par wish pour construire le masque — remplaçables par un marquage direct pendant le BFS.
+
+- Heuristique — l'ordre d'évaluation. Les combinaisons sont triées par somme de notes, mais la note ne prédit pas le revenu. Trier plutôt par « nombre de cases du groupe appartenant à un chemin actif » ferait remonter les coups payants en premier — ce qui compte beaucoup puisque le budget coupe.
+
+- Heuristique — le DISRUPT différé. Encrer une région à instabilité 3 la détruit immédiatement ; à instabilité 0, l'effet est nul ce tour-ci. La note ne voit que l'instant, d'où la règle « gratuit à égalité ». Pondérer par l'instabilité actuelle donnerait un vrai signal au lieu d'un départage.
 
 ## Idées pour le prochain algorithm : Beam search with pruning algorithm and heuristic
 
@@ -285,6 +296,22 @@ l'est.
 
 ## Versions
 
+### v4.5
+
+- **Le revenu est recalculé, plus lu.** : 1 point par rail possédé sur le chemin au lieu de 1 par wish
+- **Seuls les wishes atteignables par les 3 rails sont recalculés** — 12 ms
+  → 426 µs. Le filtre doit inclure la frontière du parcours, sinon il est faux.
+- **Horloge lue à chaque état** (avant : 1 sur 64)
+
+Les cases choisies tiennent dans les N meilleures	| Fréquence
+3	55,7 %
+4	69,6 %
+6	77,7 %
+
+Last moment in arena: -
+
+First moment in arena: 264/1439 overall & Silver league
+
 ### v4.0
 
 Remplace le greedy par une **recherche sur combinaisons**. Toutes les
@@ -300,7 +327,7 @@ Le veto de v3.10 est supprimé (redondant avec la différence de score). Une
 règle a dû être ajoutée : prendre un DISRUPT à égalité de plateau, sans quoi
 l'heuristique un-tour n'en joue aucun.
 
-Last moment in arena: -
+Last moment in arena: 343/1439 overall & Silver league
 
 First moment in arena: 333/1439 overall & Silver league
 
