@@ -20,11 +20,46 @@ Un état, c'est le plateau quelques tours plus loin. Pour chaque état gardé :
    que 3 peintures payent, et n'en jouer que les `COMBO_PRUNING_WIDTH`
    meilleures. Le tour qu'on est en train de jouer est exempté : à la racine
    on les joue toutes.
-3. Croiser avec les **3 meilleures régions à encrer**, plus le plateau sans
+3. **Jouer le tour de l'adversaire** sur ce même classement (v5.1) : les
+   meilleures cases que ses 3 peintures payent, et la région qui efface le
+   plus des nôtres pour le moins des siennes.
+4. Croiser avec les **3 meilleures régions à encrer**, plus le plateau sans
    encrage.
-4. Poser les rails sur le plateau, encrer, **recalculer le revenu des deux
+5. Poser les rails sur le plateau, encrer, **recalculer le revenu des deux
    joueurs**, noter l'état obtenu.
-5. Garder les `BEAM_WIDTH` meilleurs états de tout le niveau, doublons écartés.
+6. Garder les `BEAM_WIDTH` meilleurs états de tout le niveau, doublons écartés.
+
+#### L'adversaire, joué à chaque tour de chaque ligne (v5.1)
+
+**Il lit le plateau avec la même carte que nous.** Elle est symétrique — bâtie
+sur les souhaits des villes, sans camp dedans — donc son tour est la tête de
+notre propre classement : les meilleures cases dans l'ordre tant que ses trois
+peintures tiennent, et pour l'encrage, l'entrée la plus **négative** du score
+de disrupt, qui vaut exactement « ses rails moins les miens » vu de l'autre
+côté. Sa cible se lit donc dans le tableau déjà calculé, sans un octet de plus.
+
+**Un tour se résout comme l'arbitre le résout** : ses rails, les nôtres à côté,
+puis les encrages. Une case peinte par les deux le même tour n'appartient à
+personne — elle porte le chemin et ne rapporte à aucun des deux. Les deux
+joueurs visant la même carte, le cas est fréquent, et c'est ce qui rend le
+contest payant : lui refuser une case vaut ce qu'elle lui aurait rapporté.
+
+**La valeur des cases est donc une différence**, comme le revenu au-dessus
+d'elle : `nos cases − les siennes restées à lui`. Sans ça le beam cède
+systématiquement la meilleure case pour aller sur la quatrième, alors que
+partager (zéro pour lui, zéro pour nous) vaut mieux que « il prend la
+meilleure, on prend la quatrième ».
+
+**Ce que ça coûte : rien.** Son tour est posé une fois par état, avant nos
+combinaisons, donc il est déjà dans le plateau de référence du filtre de
+revenu. 12 000 plateaux notés par tour, profondeur 26.
+
+**Ce qu'il faut savoir** : la prédiction touche **56 %** des rails qu'il pose
+vraiment, et **36 %** de ses encrages. C'est très au-dessus du hasard, mais
+traité comme une certitude — donc le beam esquive parfois une case ou une
+région pour rien. Deux réglages bornent la casse, `FOE_PREDICT_FROM_DEPTH` et
+`FOE_DISRUPT_FROM_DEPTH` : les mettre au-delà de `MAX_BEAM_DEPTH` éteint
+l'adversaire et redonne v5.0.
 
 Et recommencer, jusqu'à épuisement des 30 ms. Le coup joué est le premier tour
 de la meilleure ligne du dernier niveau atteint.
@@ -283,11 +318,13 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
-- **Simuler l'adversaire.** Au-delà de deux ou trois tours, la ligne suppose un
-  adversaire figé : il ne pose rien, ne prend aucune de nos cases, n'encre rien.
-  v4.6 a essayé de prédire son coup (même carte de valeurs, même classement) et
-  c'était moins bon — mais c'était sans beam. À retenter au-dessus du beam, ne
-  serait-ce qu'aux deux premiers niveaux.
+- **Mieux prédire l'adversaire** — fait en v5.1, mais le modèle reste naïf : il
+  suppose qu'il lit la même carte que nous, ce qui touche 56 % de ses rails et
+  36 % de ses encrages. Le prédire sur **son historique à lui** (les cases qu'il
+  a réellement prises les tours précédents) plutôt que sur notre carte est la
+  suite logique. Une prédiction pondérée plutôt que certaine serait l'autre
+  piste : aujourd'hui une case prédite est concédée à 100 %, alors qu'elle n'est
+  juste qu'une fois sur deux.
 - **L'ordre d'évaluation des combinaisons, aux niveaux profonds.** Elles sont
   triées par somme de notes, et la note ne prédit pas le revenu — c'est mesuré :
   couper ce classement à la racine coûte 16 points. Aux niveaux profonds on le
@@ -358,6 +395,42 @@ l'est.
 
 ## Versions
 
+### v5.1
+
+**Les deux joueurs sont joués à chaque tour de chaque ligne.** L'adversaire
+pose ses rails et son encrage sur la même carte de valeurs, et les rails
+simultanés se résolvent en neutres. La valeur des cases devient une différence.
+
+Réglages inchangés par ailleurs : `BEAM_WIDTH=4`, `COMBO_PRUNING_WIDTH=64`,
+`MAX_BEAM_DEPTH=32`, vivier à 24. **12 000 plateaux notés par tour, profondeur
+26** (v5.0 : 8 000 et 20) — son tour occupe des cases, ce qui raccourcit nos
+combinaisons et laisse aller plus loin.
+
+**Retenue sur des tests en direct contre v5.0.** Mes propres mesures contre
+v4.5 ne la départageaient pas du témoin (62,5 % contre 64,0 %, 200 parties),
+mais un duel direct discrimine mieux qu'un tiers commun quand deux versions
+sont proches — à condition de surveiller les nulles.
+
+Les modèles plus faibles ont tous été mesurés moins bons, ce qui est
+contre-intuitif et vaut d'être noté :
+
+| ce qui est simulé | vs v4.5 (200 parties) |
+|---|---|
+| ses rails **et** son encrage | 62,5 % |
+| son encrage seul | 56,5 % |
+| son encrage seul, `BEAM_WIDTH=16` | 49,0 % |
+| rien (v5.0, témoin de la même série) | 64,0 % |
+
+**Piège de mesure rencontré ici.** Le planner s'arrête sur l'horloge, donc il
+n'est pas déterministe : **le même binaire v5.0 a rendu 66,7 % puis 58,7 % sur
+deux séries de 300 parties**. Tout écart de moins de ~8 points entre deux
+variantes proches est du bruit tant qu'il n'est pas reproduit. Une variante
+mesurée à 70 % sur 80 parties est retombée à 55,7 % sur 300.
+
+Last moment in arena: -
+
+First moment in arena: -
+
 ### v5.0
 
 **Beam search sur les tours**, posé sur l'élagage de v4 : le coup joué est le
@@ -405,7 +478,7 @@ timeouts. Mesurer avec `-t 4`, pas `-t 8`.
 
 Last moment in arena: -
 
-First moment in arena: -
+First moment in arena: 301/1526 overall & Silver league
 
 ### v4.5
 
@@ -419,7 +492,7 @@ Les cases choisies tiennent dans les N meilleures	| Fréquence
 4	69,6 %
 6	77,7 %
 
-Last moment in arena: -
+Last moment in arena: 299/1526 overall & Silver league
 
 First moment in arena: 264/1439 overall & Silver league
 
