@@ -4,24 +4,103 @@ CodinGame Summer Challenge 2026
 
 ## Chosen algorithm
 
-### Recherche sur combinaisons (v4)
+### Beam search (v5)
 
-Chaque tour, le bot note tout le plateau, puis essaie **tous les coups qu'il
-peut se payer** et garde celui qui laisse la meilleure position.
+Le bot ne juge plus le tour à un coup d'avance : il déroule **plusieurs tours**
+et joue le premier coup de la meilleure ligne trouvée. La machinerie de v4 est
+gardée telle quelle — elle sert maintenant d'élagage sous le beam.
 
-#### Les étapes du tour
+#### Un niveau de beam
 
-1. Noter chaque case du plateau : combien vaudrait un rail posé là.
-2. Repérer les régions où l'adversaire a le plus à perdre si on les encre.
-3. Baisser la note des cases dont la région est près d'être encrée — un rail
-   y vivrait peu.
-4. Retenir les meilleures cases, celles qui méritent qu'on y réfléchisse.
-5. En former tous les groupes de rails que les 3 peintures permettent
-   d'acheter, du plus prometteur au moins prometteur.
-6. Pour chaque groupe, et pour chaque région à encrer envisagée : appliquer la pose de rails et l'encrage des régions
-7. Mettre à jour les scrores 
-8. Noter ce plateau imaginé, et retenir le meilleur couple rails + encrage.
-8. Jouer ce couple.
+Un état, c'est le plateau quelques tours plus loin. Pour chaque état gardé :
+
+1. Noter le plateau : c'est la carte des valeurs de v4, aux trois couches
+   inchangées.
+2. Retenir les **24 meilleures cases**, en former **toutes** les combinaisons
+   que 3 peintures payent, et n'en jouer que les `COMBO_PRUNING_WIDTH`
+   meilleures. Le tour qu'on est en train de jouer est exempté : à la racine
+   on les joue toutes.
+3. Croiser avec les **3 meilleures régions à encrer**, plus le plateau sans
+   encrage.
+4. Poser les rails sur le plateau, encrer, **recalculer le revenu des deux
+   joueurs**, noter l'état obtenu.
+5. Garder les `BEAM_WIDTH` meilleurs états de tout le niveau, doublons écartés.
+
+Et recommencer, jusqu'à épuisement des 30 ms. Le coup joué est le premier tour
+de la meilleure ligne du dernier niveau atteint.
+
+#### Ce que le beam achète
+
+**Un rail qui ne paye que le tour suivant.** v4 notait le plateau un tour plus
+loin : une montagne qui termine une liaison en deux tours ressemblait à trois
+peintures jetées. Le revenu étant compté à chaque tour de la ligne, une liaison
+finie tôt rapporte autant de fois qu'il reste de tours — « finir vite » sort
+tout seul de l'heuristique, sans terme dédié.
+
+**Un DISRUPT honnête.** v4 notait chaque encrage comme s'il détruisait la
+région sur-le-champ ; sur plusieurs tours ce mensonge devient intenable. Ici un
+DISRUPT monte l'instabilité de 1 et n'encre qu'au seuil. Comme les trois
+premiers coups ne changent rien au plateau, ils ne changeraient rien à la note
+non plus : chaque coup touche donc **un quart de ce que vaut la région**, et ce
+crédit est **remboursé** au coup qui encre, où le revenu prend le relais pour de
+bon. C'est l'idée du « DISRUPT différé » notée en v4.5.
+
+#### Rien n'est copié
+
+Le planner possède **un seul plateau de travail** — propriétaire, réseau, encre,
+instabilité, un octet par case — et un coup s'y **applique et se défait**. Une
+ligne se rejoue en empilant ses coups, un enfant s'évalue en posant ses rails et
+en les retirant. Le classement d'un niveau **trie des entiers** `(note, indice)`
+empaquetés : un état est écrit une fois, quand il est gardé, et ne bouge plus.
+
+Deux lignes qui posent les mêmes rails dans un autre ordre arrivent sur le même
+plateau : un hash Zobrist des rails et des instabilités les fait fusionner.
+
+#### Ce qui coûte, et ce qui a été fait pour
+
+Tout le temps part dans le **recalcul du revenu** : chaque wish est re-résolu à
+la main sur le plateau imaginé. Deux choses le contiennent :
+
+- **Les états qui partagent un plateau ne le payent qu'une fois.** Un DISRUPT
+  qui n'encre pas ne change rien au plateau : ses enfants sont ceux du plateau
+  sans encrage, à un crédit près, et **aucun wish n'est résolu pour eux**.
+  Mieux : entre deux encrages sans effet, le mieux classé gagne toujours — même
+  plateau, même revenu, crédit plus gros — donc un seul enfant est écrit, et la
+  largeur du beam sert à des lignes vraiment différentes. Seuls les encrages qui
+  *atteignent le seuil* rejouent les combinaisons, sur le plateau amputé.
+- **Un wish n'est re-résolu que s'il peut avoir bougé.** Le plateau de l'état
+  est balayé depuis *les deux* villes de chaque wish, ce qui donne la distance
+  de toute case à chacune d'elles. Un chemin passant par les nouveaux rails
+  entre par l'un et sort par un autre, et ce qu'il fait entre les deux coûte au
+  moins la distance de grille : `d_src[a] + |a−b| + d_dst[b]`, pris au minimum
+  sur les paires, **minore** donc tout chemin neuf. Plus long que le chemin
+  actuel ⇒ le wish n'a pas pu changer. Vérifié sur 3 parties entières : zéro
+  raté.
+
+Mesuré : **10,5 → 2,6 résolutions par plateau**, 4 000 → 6 600 plateaux notés
+par tour, profondeur 9 → 14.
+
+**Pourquoi le filtre doit compter les égalités.** L'arbitre départage les
+chemins de même longueur en NESW depuis la ville demandeuse. Un rail neuf qui
+*égale* la longueur actuelle peut donc voler le chemin — et les points qui vont
+avec. D'où `≤` et non `<`.
+
+**Pourquoi la borne prend des paires.** Deux rails neufs non adjacents peuvent
+se rejoindre **par de l'ancien réseau** : le chemin entre alors par le premier
+et sort par le second. Ne regarder que les cases une par une rate ce cas — c'est
+un vrai bug, mesuré à 1 392 ratés sur une partie avant correction.
+
+#### La carte des valeurs ne se rebâtit presque jamais
+
+Les couches 1 et 2 ne lisent que le terrain et l'encre, **jamais les rails** :
+la carte ne dépend donc que de l'ensemble des régions encrées, et tous les états
+qui n'ont rien encré de neuf partagent la même. Un masque de bits des régions
+encrées sert de clé de cache. Mesuré : **2 reconstructions par tour**, pour une
+centaine d'états développés.
+
+La couche 3 (la remise d'encre) est appliquée au moment de classer les cases, pas
+dans la carte : le beam fait monter l'instabilité au fil des tours, et la carte
+en dessous reste bonne pour toute la ligne.
 
 #### Ce qui compose la note d'une case
 
@@ -38,32 +117,19 @@ en cases** : l'arbitre note bien une liaison au nombre de cases, mais ce A*
 choisit où dépenser nos 3 points du tour, et une montagne en coûte vraiment 3.
 Mesurer l'inverse a coûté 20 points de winrate (v3.11, abandonnée).
 
-#### Comment un plateau imaginé est noté
+#### Comment un état est noté
 
-`différence de score × 10000 + somme des notes des cases achetées`
+`(revenu encaissé − revenu adverse) × 2²⁴ + valeur des cases achetées + crédits
+de DISRUPT`
 
-Le score, c'est celui de la partie — celui que l'arbitre a annoncé en début de
-tour — plus ce que le plateau imaginé rapporterait à la fin du tour.
-
-**Le revenu se recalcule, il ne se lit pas.** Chaque paire de villes qui se
-souhaitent est re-reliée sur le plateau d'après coup ; si un chemin existe, le
-plus court devient la connexion active et **chaque joueur touche 1 point par
-rail qu'il possède dessus**. Un rail qui achève une liaison rapporte donc dès
-ce tour, et une liaison que l'encrage a coupée cesse de rapporter — même
-coupée loin de la région encrée.
+Le revenu est celui de **toute la ligne** : chaque tour simulé rapporte à chacun
+1 point par rail qu'il possède sur le chemin actif de chaque wish. Les scores de
+départ ne sont pas comptés — ils sont les mêmes pour tous les états d'un niveau.
 
 Un point de revenu vaut plus que n'importe quelle somme de notes : gagner du
-score passe toujours avant accumuler du bon terrain. La différence se compte
-sur **les deux joueurs**, donc couper un revenu adverse vaut autant qu'en
-créer un.
-
-C'est ce qui remplace le veto de v3.10 : une coupe qui nous coûte plus de
-revenu qu'à l'adversaire se note mal toute seule, sans règle dédiée.
-
-**Un encrage est gratuit**, donc il est pris dès que le plateau est *à
-égalité* — jamais au-dessus d'un vrai gain. Sans cette règle v4.0 ne jouait
-**aucun encrage de la partie** : la note ne voit que la liaison coupée
-aujourd'hui, jamais l'instabilité qui encrera la région plus tard.
+score passe toujours avant accumuler du bon terrain. Le poids est passé de
+10 000 à 2²⁴ parce que le beam somme les cases de **toute une ligne**, pas d'un
+seul tour.
 
 #### Ce qui départage deux cases de même note
 
@@ -71,22 +137,6 @@ L'égalité est le cas normal : un chemin récompense toutes ses cases à
 l'identique. Dans l'ordre : la note, puis l'adjacence au réseau déjà posé,
 puis le terrain le moins cher, puis l'ordre de balayage pour rester
 déterministe.
-
-**L'adjacence est plus faible qu'en v3.10, sciemment.** Le greedy reclassait
-entre chaque rail : le 2ᵉ voyait le 1ᵉʳ comme du réseau. La recherche doit
-former ses groupes avant de les juger, donc aucune case candidate ne voit les
-autres. La note ne rattrape la contiguïté que lorsqu'elle **termine une
-liaison** : trois rails alignés qui n'en terminent aucune valent autant que
-trois rails éparpillés de même note.
-
-Mesuré sur 100 tours : **39 % des rails d'un tour touchent un autre rail du
-même tour, contre 42 % en v3.10**. L'écart est faible parce que la recherche
-pose plus de rails (236 contre 218) — elle voit les groupes qui tiennent dans
-3 peintures, là où le greedy s'enfermait en prenant une montagne à 3 en
-premier.
-
-Piste pour le rétablir : compter l'adjacence interne au groupe au moment de
-noter, sous la somme des notes.
 
 #### Trois règles apprises à la dure
 
@@ -103,6 +153,19 @@ l'orientation de l'arbitre conservée telle quelle.
 **La diffusion remplit la fin de partie.** Les plus courts chemins sont bâtis
 bien avant la fin : sans elle, **65 tours sur 100 étaient des `WAIT`** et le
 bot posait 86 rails ; avec, zéro `WAIT` et 190 rails.
+
+#### Ne pas élaguer les cases, élaguer les combinaisons
+
+Le réflexe — « tirer les combinaisons des 6 meilleures cases au lieu de 24 » —
+est **le pire réglage mesuré** : à profondeur 1, il perd 45 points de winrate
+d'un coup. Les cases finalement achetées ne tiennent dans les 6 premières que
+77 % du temps, et ce qui est jeté là ne revient jamais.
+
+Ce qu'il faut couper, c'est la **liste des combinaisons**, pas le vivier de
+cases : toutes les combinaisons des 24 cases sont formées (quelques milliers
+d'additions), triées par somme de notes, et seules les meilleures sont jouées.
+Et **jamais à la racine** : la somme des notes ne prédit pas le revenu, donc
+couper le classement du tour qu'on joue vraiment coûte encore 16 points.
 
 ## Debug viewer
 
@@ -125,10 +188,10 @@ Sur le plateau :
 - le panneau latéral classe les régions encrables par score de disrupt, et le
   survol d'une case donne sa valeur, sa région et son score.
 
-Contrairement au beam, **le planner est déterministe** : il ne s'arrête pas
-sur l'horloge. Rejouer le même log avec le même binaire donne exactement la
-même sortie, et un replay qui diffère du log veut dire que le log a été écrit
-par une autre version du bot.
+**Le planner s'arrête sur l'horloge**, donc un rejeu n'est plus reproductible
+au bit près : une machine plus chargée voit un niveau de moins et peut jouer
+un autre coup. Un replay qui diffère du log ne prouve donc plus que le log
+vient d'une autre version — c'est le prix du beam, que v3 et v4 n'avaient pas.
 
 ```sh
 make replay LOG=.colosseum/logs/firstenv/run-*/game_*_p0.events.jsonl
@@ -220,27 +283,26 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
+- **Simuler l'adversaire.** Au-delà de deux ou trois tours, la ligne suppose un
+  adversaire figé : il ne pose rien, ne prend aucune de nos cases, n'encre rien.
+  v4.6 a essayé de prédire son coup (même carte de valeurs, même classement) et
+  c'était moins bon — mais c'était sans beam. À retenter au-dessus du beam, ne
+  serait-ce qu'aux deux premiers niveaux.
+- **L'ordre d'évaluation des combinaisons, aux niveaux profonds.** Elles sont
+  triées par somme de notes, et la note ne prédit pas le revenu — c'est mesuré :
+  couper ce classement à la racine coûte 16 points. Aux niveaux profonds on le
+  coupe quand même, faute de budget. Trier plutôt par « nombre de cases du
+  groupe sur un chemin actif » ferait remonter les coups payants.
+- **Les balayages de distance sont devenus le plancher du coût** : 2 par wish et
+  par état, une centaine d'états, ~10 000 balayages par tour. Le plateau d'un
+  enfant ne diffère de celui de son père que de 3 rails ; une mise à jour
+  incrémentale des distances les remplacerait presque tous.
+- **Répartir le budget par profondeur.** La racine joue toutes ses
+  combinaisons, les niveaux suivants en jouent `COMBO_PRUNING_WIDTH`. Entre les
+  deux il n'y a rien : un dégradé (large en haut, étroit en bas) est sans doute
+  meilleur que la marche d'escalier actuelle.
 - diffusion : Ajouter 4 moitiés sur un case donne un score plus grand que les cases elles mêmes. Il faut ajouter 1/4 ? Est ce qu'on veut que ces cases puissent être meilleur que d'des principales a* ?
-- Est ce que le choix résultant des 24 meilleurs combinaisons tombe souvent sur les 3/4 premiers ?
-    - Si oui, alors on peut réduire la PRUNING_WIDTH à 10 -> OUI IL SEMBLERAIT. 
-    - Si non, alors il faudrait la laisser élevé
 - Moins punir les cases inked
-- Pruning — le plus gros levier. wishReach est un char par case par wish (17 × 442 = 7,5 Ko relus intégralement à chaque plateau). En bitset (uint64_t), c'est 56 octets par wish, et le test des 3 cases devient 3 lectures de bits. Surtout, baselineIncome fait deux passes O(N) par wish pour construire le masque — remplaçables par un marquage direct pendant le BFS.
-
-- Heuristique — l'ordre d'évaluation. Les combinaisons sont triées par somme de notes, mais la note ne prédit pas le revenu. Trier plutôt par « nombre de cases du groupe appartenant à un chemin actif » ferait remonter les coups payants en premier — ce qui compte beaucoup puisque le budget coupe.
-
-- Heuristique — le DISRUPT différé. Encrer une région à instabilité 3 la détruit immédiatement ; à instabilité 0, l'effet est nul ce tour-ci. La note ne voit que l'instant, d'où la règle « gratuit à égalité ». Pondérer par l'instabilité actuelle donnerait un vrai signal au lieu d'un départage.
-
-## Idées pour le prochain algorithm : Beam search with pruning algorithm and heuristic
-
-Lorsqu'on mettra un beam search par dessus, on pourrait faire des depth entre les tours pour choisir quelle région à disrupt parmis les 3 meilleurs. Faire une depth séciale pour les DISRUPT :
-- Pruning comme avant pour avoir les disruptPruningWidth meilleurs régions à supprimer
-- On obtient Bwidth x disruptPruningWidth états
-- Sur une copie de chaque état, supprimer entierement la région pour l'heuristic UNIQUEMENT (PROBLEME : ne favorise pas le passage de 4 à 5 par rapport de 0 à 1)
-- Appliquer l'heuristic pour choisir les Bwidth meilleurs état
-- ink de 1 sur chaque Bwidth vrai état
-
-On peut commencer avec PRUNING_WIDTH=10 (branching factor)
 
 ### Idées de l'époque encore valables
 
@@ -295,6 +357,55 @@ sans nulles du côté opposé, veut dire que la mesure est cassée, pas que le b
 l'est.
 
 ## Versions
+
+### v5.0
+
+**Beam search sur les tours**, posé sur l'élagage de v4 : le coup joué est le
+premier tour de la meilleure ligne, et non plus la meilleure ligne d'un tour.
+
+**66,7 % contre v4.5** (200 V – 98 D – 2 N, 300 parties, `-t 4`).
+
+Réglages : `BEAM_WIDTH=4`, `COMBO_PRUNING_WIDTH=64`, `MAX_BEAM_DEPTH=32`,
+vivier de cases inchangé à 24. Profondeur atteinte ~20 tours, 8 400 plateaux
+notés par tour (v4.5 : 1 tour, 4 700 plateaux).
+
+Deux des trois réglages étaient des pièges, et c'est là qu'est passé l'essentiel
+du travail :
+
+| réglage | contre v4.5 (80 parties) |
+|---|---|
+| vivier réduit à 6 cases, profondeur 1 | 27,5 % |
+| vivier 24, 32 combinaisons jouées, profondeur 1 | 41,2 % |
+| vivier 24, toutes combinaisons, profondeur 1 | ~57 % |
+| vivier 24, racine exhaustive, beam `w2 c64 d8` | 66,7 % |
+| vivier 24, racine exhaustive, beam `w4 c64 d32` | 66,7 % (66,7 % sur 300) |
+| beam `w8 c64 d32` | 46,9 % |
+
+**Le vivier de cases ne doit pas être élagué** (−45 points) et **la racine ne
+doit pas voir son classement de combinaisons coupé** (−16 points). Le beam
+rapporte une dizaine de points une fois ces deux erreurs évitées, et le budget
+va aux tours d'une ligne plutôt qu'au nombre de lignes : 2 et 4 se valent, 8 et
+16 décrochent.
+
+**Le filtre de revenu** — balayage des deux villes de chaque wish, puis borne
+par paires sur les nouveaux rails — fait tomber les résolutions de 10,5 à 2,6
+par plateau : +65 % de plateaux notés, profondeur 9 → 14 à réglages égaux.
+Vérifié exhaustivement sur 3 parties : jamais un changement de revenu raté.
+
+Ce que v5 sait faire que v4 ne savait pas : acheter un rail qui ne paye qu'au
+tour suivant, et monter l'instabilité d'une région sur plusieurs tours pour
+l'encrer au moment où ça coupe le plus.
+
+Ce qu'elle suppose : **l'adversaire est figé** sur toute la ligne. C'est faux,
+et c'est la première chose à attaquer.
+
+Attention : le planner n'est plus déterministe (il s'arrête sur l'horloge), donc
+deux mesures du même binaire diffèrent, et une machine chargée fait des
+timeouts. Mesurer avec `-t 4`, pas `-t 8`.
+
+Last moment in arena: -
+
+First moment in arena: -
 
 ### v4.5
 

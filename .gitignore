@@ -79,3 +79,5 @@ tools/tiles/
 
 #AI
 .serena
+# cg-colosseum bundles the submitted source here
+target/
