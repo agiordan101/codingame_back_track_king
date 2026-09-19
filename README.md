@@ -338,7 +338,8 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
   combinaisons, les niveaux suivants en jouent `COMBO_PRUNING_WIDTH`. Entre les
   deux il n'y a rien : un dégradé (large en haut, étroit en bas) est sans doute
   meilleur que la marche d'escalier actuelle.
-- diffusion : Ajouter 4 moitiés sur un case donne un score plus grand que les cases elles mêmes. Il faut ajouter 1/4 ? Est ce qu'on veut que ces cases puissent être meilleur que d'des principales a* ?
+- 
+Il faut faire une diffusion des valeurs des cases pour créer plus de combinaison pour les premieres depth. Ajouter 4 moitiés sur un case donne un score plus grand que les cases elles mêmes. Il faut ajouter 1/4 de chaque cases sur ses adjacentes qui étaient à 0 au début.
 - Moins punir les cases inked
 
 ### Idées de l'époque encore valables
@@ -401,40 +402,16 @@ l'est.
 pose ses rails et son encrage sur la même carte de valeurs, et les rails
 simultanés se résolvent en neutres. La valeur des cases devient une différence.
 
-Réglages inchangés par ailleurs : `BEAM_WIDTH=4`, `COMBO_PRUNING_WIDTH=64`,
-`MAX_BEAM_DEPTH=32`, vivier à 24. **12 000 plateaux notés par tour, profondeur
-26** (v5.0 : 8 000 et 20) — son tour occupe des cases, ce qui raccourcit nos
-combinaisons et laisse aller plus loin.
-
-**Retenue sur des tests en direct contre v5.0.** Mes propres mesures contre
-v4.5 ne la départageaient pas du témoin (62,5 % contre 64,0 %, 200 parties),
-mais un duel direct discrimine mieux qu'un tiers commun quand deux versions
-sont proches — à condition de surveiller les nulles.
-
-Les modèles plus faibles ont tous été mesurés moins bons, ce qui est
-contre-intuitif et vaut d'être noté :
-
-| ce qui est simulé | vs v4.5 (200 parties) |
-|---|---|
-| ses rails **et** son encrage | 62,5 % |
-| son encrage seul | 56,5 % |
-| son encrage seul, `BEAM_WIDTH=16` | 49,0 % |
-| rien (v5.0, témoin de la même série) | 64,0 % |
-
-**Piège de mesure rencontré ici.** Le planner s'arrête sur l'horloge, donc il
-n'est pas déterministe : **le même binaire v5.0 a rendu 66,7 % puis 58,7 % sur
-deux séries de 300 parties**. Tout écart de moins de ~8 points entre deux
-variantes proches est du bruit tant qu'il n'est pas reproduit. Une variante
-mesurée à 70 % sur 80 parties est retombée à 55,7 % sur 300.
+**Retenue sur des tests en direct contre v5.0.** : 123W 96L 0D
 
 Last moment in arena: -
 
-First moment in arena: -
+First moment in arena: 315/1545 overall & Silver league
 
 ### v5.0
 
 **Beam search sur les tours**, posé sur l'élagage de v4 : le coup joué est le
-premier tour de la meilleure ligne, et non plus la meilleure ligne d'un tour.
+premier tour de la meilleure ligne à travers les depth
 
 **66,7 % contre v4.5** (200 V – 98 D – 2 N, 300 parties, `-t 4`).
 
@@ -454,29 +431,7 @@ du travail :
 | vivier 24, racine exhaustive, beam `w4 c64 d32` | 66,7 % (66,7 % sur 300) |
 | beam `w8 c64 d32` | 46,9 % |
 
-**Le vivier de cases ne doit pas être élagué** (−45 points) et **la racine ne
-doit pas voir son classement de combinaisons coupé** (−16 points). Le beam
-rapporte une dizaine de points une fois ces deux erreurs évitées, et le budget
-va aux tours d'une ligne plutôt qu'au nombre de lignes : 2 et 4 se valent, 8 et
-16 décrochent.
-
-**Le filtre de revenu** — balayage des deux villes de chaque wish, puis borne
-par paires sur les nouveaux rails — fait tomber les résolutions de 10,5 à 2,6
-par plateau : +65 % de plateaux notés, profondeur 9 → 14 à réglages égaux.
-Vérifié exhaustivement sur 3 parties : jamais un changement de revenu raté.
-
-Ce que v5 sait faire que v4 ne savait pas : acheter un rail qui ne paye qu'au
-tour suivant, et monter l'instabilité d'une région sur plusieurs tours pour
-l'encrer au moment où ça coupe le plus.
-
-Ce qu'elle suppose : **l'adversaire est figé** sur toute la ligne. C'est faux,
-et c'est la première chose à attaquer.
-
-Attention : le planner n'est plus déterministe (il s'arrête sur l'horloge), donc
-deux mesures du même binaire diffèrent, et une machine chargée fait des
-timeouts. Mesurer avec `-t 4`, pas `-t 8`.
-
-Last moment in arena: -
+Last moment in arena: 301/1526 overall & Silver league
 
 First moment in arena: 301/1526 overall & Silver league
 
@@ -492,7 +447,7 @@ Les cases choisies tiennent dans les N meilleures	| Fréquence
 4	69,6 %
 6	77,7 %
 
-Last moment in arena: 299/1526 overall & Silver league
+Last moment in arena: 304/1526 overall & Silver league
 
 First moment in arena: 264/1439 overall & Silver league
 
