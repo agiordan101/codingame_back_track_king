@@ -326,14 +326,15 @@ depth  states    formed     kept   scored     A*   solves   sweeps
       3      22      1028     1028     1542    400     1278     1320
       4      48      1634     1536     2304    600     1116     2880
 turn : 7692 us / 30 ms  depth 4  3884 states scored  2686 combos formed  1080 A*  2394 solves  4760 sweeps  1 rails (3 paint)  disrupt -1 -->
-- **Les balayages de distance sont devenus le plancher du coût** : 2 par wish et
-  par état, une centaine d'états, ~10 000 balayages par tour. Le plateau d'un
-  enfant ne diffère de celui de son père que de 3 rails ; une mise à jour
-  incrémentale des distances les remplacerait presque tous.
-- Vu qu'on peut traiter enormément de combinaisons, le pruning aggressif et biaisé est maintenant contre productif.
-  - Pruning: Ne pas addition les valeurs sortante des a*, mais garder la meilleur uniquement.
-  - Moins punir les cases inked. plutot que de multipler directement on pourrait faire varier entre 75% et 100% de la valeur de la case
-  - Le puning aggressif fait que le bot manque clairement de possibilitées, surtout en fin de partie. Par exmeple les chemins les plus court qui coute beaucoup de peinture ne sont jamais considéré alors qu'ils raporterait des points. Il faudrait peut être faire d'autres A* qui ne prendre pas en compte les coups de peinture, afin de quand même s'orienter par default les chemins les plus court en nombre de cases lorsque les chemins les moins couteux en peinture ont déjà été fait.
+
+Vu qu'on peut traiter enormément de combinaisons, le pruning aggressif et biaisé est maintenant contre productif. Il faudrait diminuer ses décision en faveur de la recherche en largueur/profondeur.
+Voici 4 idées pour améliorer ce pruning.
+Implémente les 4 idées séparémment en fesant 4 nouvelle version intermédiaire et fais les combattre tous ensemble avec v5.0 et v5.4 dans une nouvelle arène/env. "v5.4_pruning_tests". Lorsqu'il auront 200 games chaqu'un, fais des conclusions.
+
+  1. Pruning: Ne pas addition les valeurs sortante des a*, mais garder la meilleur uniquement.
+  2. Moins punir les cases inked. plutot que de multipler directement on pourrait faire varier entre 80% et 100% de la valeur de la case.
+  3. Ne pas punir les cases inked et laisser la recherche en profondeur prouver que la pose de certains rails dans des case qui vont être inked est une perte de temps, et donc de score. Mettre la pression en posant les rails jusqu'au bout de la conenction peut être aussi benefique.
+  4. Le puning aggressif fait que le bot manque clairement de possibilitées, surtout en fin de partie. Par exmeple les chemins les plus court qui coute beaucoup de peinture ne sont jamais considéré alors qu'ils raporterait des points. Il faudrait peut être faire d'autres A* qui ne prendre pas en compte les coups de peinture, afin de quand même s'orienter par default les chemins les plus court en nombre de cases lorsque les chemins les moins couteux en peinture ont déjà été fait.
 
 - Il faut faire une diffusion des valeurs des cases pour créer plus de combinaison pour les premieres depth. Ajouter 4 moitiés sur un case donne un score plus grand que les cases elles mêmes. Il faut ajouter 1/4 de chaque cases sur ses adjacentes qui étaient à 0 au début.
 - **L'ordre d'évaluation des combinaisons, aux niveaux profonds.** Elles sont
@@ -389,6 +390,18 @@ l'est.
 
 ## Versions
 
+### v5.5
+
+**La carte de valeurs servait périmée un tiers du temps.** En fin de partie,
+un état héritait de la carte bleue pour le plateau d'un autre : les chemins
+contournaient des régions désencrées depuis longtemps. Mesuré sur 10 000
+expansions : 35 % de cartes fausses, ramenées à 0 sans rien coûter.
+
+Duel direct contre v5.4 : 95W-65L et 140 nulles, 59,4 % sur les décisives,
+IC95 [51,8 – 67,0], p = 0,018.
+
+Réglages inchangés depuis la v5.4 : seul le cache change.
+
 ### v5.4
 
 **Le beam est court et large.** Un balayage de 16 variantes croisant la
@@ -414,10 +427,14 @@ p = 0,034. Le gain réel est de l'ordre de **4 points**, pas davantage : le
 réglage du pruning seul (largeur du pool, decay) n'a jamais rien séparé, et
 c'est `COMBO_FLOOR` et le plafond de profondeur qui portent tout l'effet.
 
+First moment in arena: 301/1545 overall & Silver league
+
 ### v5.3
 
 Encourage width exploration (with decay) rather than deep and incertain exploration.
 Improve metrics
+
+Last moment in arena: 300/1545 overall & Silver league
 
 First moment in arena: 289/1545 overall & Silver league
 
