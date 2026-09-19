@@ -373,6 +373,16 @@ l'est.
 
 ## Versions
 
+### v5.7
+
+L'A cherchait **le chemin le moins cher en peinture**, alors que le jeu
+paie le chemin **le plus court en nombre de cases**. Une fois une connexion active,
+une seconde passe éclaire donc aussi ce chemin-là, récompensé à 55 % pour que
+le chemin A* garde la priorité tant qu'il reste des cases libres dessus.
+
+Duel direct contre v5.6 : 350W-249L sur 600 parties, 58,4 %, IC95
+[54,5 - 62,4], p = 0,00004.
+
 ### v5.6
 
 **Une case sur plusieurs corridors prenait la somme de leurs récompenses.**
@@ -393,6 +403,10 @@ Duel direct contre v5.4 : 95W-65L et 140 nulles, 59,4 % sur les décisives,
 IC95 [51,8 – 67,0], p = 0,018.
 
 Réglages inchangés depuis la v5.4 : seul le cache change.
+
+First moment in arena: 295/1545 overall & Silver league
+
+First moment in arena: 295/1545 overall & Silver league
 
 ### v5.4
 
@@ -419,7 +433,7 @@ p = 0,034. Le gain réel est de l'ordre de **4 points**, pas davantage : le
 réglage du pruning seul (largeur du pool, decay) n'a jamais rien séparé, et
 c'est `COMBO_FLOOR` et le plafond de profondeur qui portent tout l'effet.
 
-Last moment in arena: 307/1545 overall & Silver league
+Last moment in arena: 282/1545 overall & Silver league
 
 First moment in arena: 301/1545 overall & Silver league
 
