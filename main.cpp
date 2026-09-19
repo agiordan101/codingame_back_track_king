@@ -1,4 +1,4 @@
-#define BOT_VERSION "5.3"
+#define BOT_VERSION "5.4"
 
 // A beam search over turns, built on v4's one-turn machinery, with both
 // players played out on every turn of every line.
@@ -818,9 +818,6 @@ public:
         beginTurn(board);
         runBeam();
         emitMove(outAction, outDisrupt);
-        // After the search: it may have spread the map to find candidates,
-        // and it is that final map the move was read off.
-        DBG_VALUES(viewerValues());
     }
 
 private:
@@ -2018,13 +2015,17 @@ private:
     void reportRootDebug()
     {
 #ifdef DEBUG_TOOL
+        // Taken here, not after the search: value[] is scratch the beam keeps
+        // rewriting, so once runBeam returns it holds some deep state's board.
+        DBG_VALUES(viewerValues());
         DBG_REGION_SCORES(regionScore);
         for (int d = 0; d < nDisrupt; d++)
             tallyCut(disruptCand[d]);
 #endif
     }
 
-    // The map the move was read off, discount included: the viewer draws this.
+    // The root's map, discount included: the board the turn's candidates were
+    // ranked on, which is what the viewer draws.
     vector<int> viewerValues() const
     {
         vector<int> out(N, 0);

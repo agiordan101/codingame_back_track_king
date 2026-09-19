@@ -318,15 +318,23 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
-- Je vois un problème dans l'évaluation des cases du pruning dans le viewer. Les chemins A* évitent des régions volontairement alors qu'elles ne sont pas inked. Résultats à chaque tour de jeu les chemins peuvent changer et ne pas être les vrais chemins les plus court.
-Ou alors c'est uniquement un "problème d'affichage" et les valeurs du pruning log pour le viewer ne sont pas celles de la depth 0
+<!-- 
+- Résultats que je ne comprends pas. Comment se fait-il qu'il y a que 8 states à la depth 2 et 20 formed ? Alors qu'on a BEAM_WIDTH = 48 et un pruning width > 20. La map n'a plus beaucoup de cases mais bien pleins de 20 cases sont adjacent à des rails. Peut être pas aux chemins a* par contre :
+depth  states    formed     kept   scored     A*   solves   sweeps
+      1       1         4        4        8     20        0       80
+      2       8        20       20       30     60        0      480
+      3      22      1028     1028     1542    400     1278     1320
+      4      48      1634     1536     2304    600     1116     2880
+turn : 7692 us / 30 ms  depth 4  3884 states scored  2686 combos formed  1080 A*  2394 solves  4760 sweeps  1 rails (3 paint)  disrupt -1 -->
 - **Les balayages de distance sont devenus le plancher du coût** : 2 par wish et
   par état, une centaine d'états, ~10 000 balayages par tour. Le plateau d'un
   enfant ne diffère de celui de son père que de 3 rails ; une mise à jour
   incrémentale des distances les remplacerait presque tous.
 - Vu qu'on peut traiter enormément de combinaisons, le pruning aggressif et biaisé est maintenant contre productif.
   - Pruning: Ne pas addition les valeurs sortante des a*, mais garder la meilleur uniquement.
-  - Moins punir les cases inked
+  - Moins punir les cases inked. plutot que de multipler directement on pourrait faire varier entre 75% et 100% de la valeur de la case
+  - Le puning aggressif fait que le bot manque clairement de possibilitées, surtout en fin de partie. Par exmeple les chemins les plus court qui coute beaucoup de peinture ne sont jamais considéré alors qu'ils raporterait des points. Il faudrait peut être faire d'autres A* qui ne prendre pas en compte les coups de peinture, afin de quand même s'orienter par default les chemins les plus court en nombre de cases lorsque les chemins les moins couteux en peinture ont déjà été fait.
+
 - Il faut faire une diffusion des valeurs des cases pour créer plus de combinaison pour les premieres depth. Ajouter 4 moitiés sur un case donne un score plus grand que les cases elles mêmes. Il faut ajouter 1/4 de chaque cases sur ses adjacentes qui étaient à 0 au début.
 - **L'ordre d'évaluation des combinaisons, aux niveaux profonds.** Elles sont
   triées par somme de notes, et la note ne prédit pas le revenu — c'est mesuré :

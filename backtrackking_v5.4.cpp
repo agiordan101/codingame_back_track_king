@@ -1,4 +1,4 @@
-#define BOT_VERSION "5.3"
+#define BOT_VERSION "5.4"
 
 // A beam search over turns, built on v4's one-turn machinery, with both
 // players played out on every turn of every line.
