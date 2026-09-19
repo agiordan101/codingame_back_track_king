@@ -318,8 +318,6 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
-- rollback 5.5 et retester dans codingame
-- Il faut faire une diffusion des valeurs des cases pour créer plus de combinaison pour les premieres depth. Ajouter 4 moitiés sur un case donne un score plus grand que les cases elles mêmes. Il faut ajouter 1/4 de chaque cases sur ses adjacentes qui étaient à 0 au début.
 - **L'ordre d'évaluation des combinaisons, aux niveaux profonds.** Elles sont
   triées par somme de notes, et la note ne prédit pas le revenu — c'est mesuré :
   couper ce classement à la racine coûte 16 points. Aux niveaux profonds on le
@@ -373,9 +371,21 @@ l'est.
 
 ## Versions
 
+### v5.8
+
+**La carte n'éclairait que les corridors eux-mêmes**, donc un rail posé à une
+case de l'un — celui qui déroute un trajet payé à l'adversaire — restait
+invisible au classement. Une diffusion permanente donne désormais à chaque case
+laissée à zéro un quart de ce qui l'entoure.
+
+Duel direct contre v5.7 : 314W-284L sur 600 parties, 52,5 %, IC95
+[48,5 - 56,5], p = 0,22 — non significatif, mais stable (52,5 % à 200 comme à
+400 parties). Le diviseur compte : à 2 la diffusion noie le pool de candidats
+et le bot tombe à 18,5 %.
+
 ### v5.7
 
-L'A cherchait **le chemin le moins cher en peinture**, alors que le jeu
+L'A* cherchait **le chemin le moins cher en peinture**, alors que le jeu
 paie le chemin **le plus court en nombre de cases**. Une fois une connexion active,
 une seconde passe éclaire donc aussi ce chemin-là, récompensé à 55 % pour que
 le chemin A* garde la priorité tant qu'il reste des cases libres dessus.
