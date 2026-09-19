@@ -318,37 +318,22 @@ bot dans `colosseum.toml`, avec le bouton *Live* du viewer pour suivre.
 
 ## Idées à essayer
 
-- **Mieux prédire l'adversaire** — fait en v5.1, mais le modèle reste naïf : il
-  suppose qu'il lit la même carte que nous, ce qui touche 56 % de ses rails et
-  36 % de ses encrages. Le prédire sur **son historique à lui** (les cases qu'il
-  a réellement prises les tours précédents) plutôt que sur notre carte est la
-  suite logique. Une prédiction pondérée plutôt que certaine serait l'autre
-  piste : aujourd'hui une case prédite est concédée à 100 %, alors qu'elle n'est
-  juste qu'une fois sur deux.
+- Je vois un problème dans l'évaluation des cases du pruning dans le viewer. Les chemins A* évitent des régions volontairement alors qu'elles ne sont pas inked. Résultats à chaque tour de jeu les chemins peuvent changer et ne pas être les vrais chemins les plus court.
+Ou alors c'est uniquement un "problème d'affichage" et les valeurs du pruning log pour le viewer ne sont pas celles de la depth 0
+- **Les balayages de distance sont devenus le plancher du coût** : 2 par wish et
+  par état, une centaine d'états, ~10 000 balayages par tour. Le plateau d'un
+  enfant ne diffère de celui de son père que de 3 rails ; une mise à jour
+  incrémentale des distances les remplacerait presque tous.
+- Vu qu'on peut traiter enormément de combinaisons, le pruning aggressif et biaisé est maintenant contre productif.
+  - Pruning: Ne pas addition les valeurs sortante des a*, mais garder la meilleur uniquement.
+  - Moins punir les cases inked
+- Il faut faire une diffusion des valeurs des cases pour créer plus de combinaison pour les premieres depth. Ajouter 4 moitiés sur un case donne un score plus grand que les cases elles mêmes. Il faut ajouter 1/4 de chaque cases sur ses adjacentes qui étaient à 0 au début.
 - **L'ordre d'évaluation des combinaisons, aux niveaux profonds.** Elles sont
   triées par somme de notes, et la note ne prédit pas le revenu — c'est mesuré :
   couper ce classement à la racine coûte 16 points. Aux niveaux profonds on le
   coupe quand même, faute de budget. Trier plutôt par « nombre de cases du
   groupe sur un chemin actif » ferait remonter les coups payants.
-- **Les balayages de distance sont devenus le plancher du coût** : 2 par wish et
-  par état, une centaine d'états, ~10 000 balayages par tour. Le plateau d'un
-  enfant ne diffère de celui de son père que de 3 rails ; une mise à jour
-  incrémentale des distances les remplacerait presque tous.
-- **Répartir le budget par profondeur.** La racine joue toutes ses
-  combinaisons, les niveaux suivants en jouent `COMBO_PRUNING_WIDTH`. Entre les
-  deux il n'y a rien : un dégradé (large en haut, étroit en bas) est sans doute
-  meilleur que la marche d'escalier actuelle.
-- 
-Il faut faire une diffusion des valeurs des cases pour créer plus de combinaison pour les premieres depth. Ajouter 4 moitiés sur un case donne un score plus grand que les cases elles mêmes. Il faut ajouter 1/4 de chaque cases sur ses adjacentes qui étaient à 0 au début.
-- Moins punir les cases inked
-
-### Idées de l'époque encore valables
-
-- Une lookup table de `path` entre 2 cases (distance A* + liste des régions
-  traversées), plus un index inverse région → chemins, pour ne recalculer que
-  les chemins invalidés quand une région est encrée. `PathTable` faisait ça en
-  v2.x ; le planner v3 recalcule tout, ce qui coûte moins cher que le cache à
-  cette taille de plateau.
+- **Mieux prédire l'adversaire**
 
 ## Protocole de mesure
 
@@ -396,6 +381,38 @@ l'est.
 
 ## Versions
 
+### v5.4
+
+**Le beam est court et large.** Un balayage de 16 variantes croisant la
+profondeur (3 et 4) et `BEAM_WIDTH` (24, 32, 48, 64) sur deux pools de
+combinaisons, ~440 parties chacune, donne trois résultats convergents :
+
+- **La profondeur 6 est trop longue.** La v5.3 finit 22e sur 23.
+- **La profondeur 3 est trop courte.** Toutes les variantes D3 sont dans la
+  moitié basse : le beam épuise son arbre avant l'horloge et le budget libéré
+  ne se reconvertit en rien (80 états en fin de partie contre 192 pour v5.3).
+  Raccourcir n'aide que tant qu'il reste de quoi élargir.
+- **`BEAM_WIDTH=48` est l'optimum**, dans le même ordre b48 > b64 > b32 > b24
+  pour les deux pools indépendamment.
+
+Réglages : `BEAM_WIDTH=48`, `MAX_BEAM_DEPTH=4`, `COMBO_PRUNING_WIDTH=200`,
+`COMBO_DECAY=2`, `COMBO_FLOOR=50`.
+
+**Retenue sur duels contre v5.3** : 214W-186L (53,5 %) et 216W-184L (54,0 %)
+pour les deux meilleures variantes, qui ne diffèrent que par un pool dont
+l'arène a montré qu'il ne sépare rien. Prises une par une aucune n'est
+significative ; regroupées, 430W-370L sur 800 parties, IC95 [50,3 – 57,2],
+p = 0,034. Le gain réel est de l'ordre de **4 points**, pas davantage : le
+réglage du pruning seul (largeur du pool, decay) n'a jamais rien séparé, et
+c'est `COMBO_FLOOR` et le plafond de profondeur qui portent tout l'effet.
+
+### v5.3
+
+Encourage width exploration (with decay) rather than deep and incertain exploration.
+Improve metrics
+
+First moment in arena: 289/1545 overall & Silver league
+
 ### v5.1
 
 **Les deux joueurs sont joués à chaque tour de chaque ligne.** L'adversaire
@@ -404,9 +421,9 @@ simultanés se résolvent en neutres. La valeur des cases devient une différenc
 
 **Retenue sur des tests en direct contre v5.0.** : 123W 96L 0D
 
-Last moment in arena: -
+Last moment in arena: 296/1545 overall & Silver league
 
-First moment in arena: 315/1545 overall & Silver league
+First moment in arena: 296/1545 overall & Silver league
 
 ### v5.0
 
